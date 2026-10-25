@@ -1,0 +1,1 @@
+import{t as e}from"./C0uTJ8rx.js";function t(e){return[...e].length<12}function n(t){return t instanceof e&&t.status===400&&t.path===`new`}export{t as n,n as t};

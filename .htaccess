@@ -1,0 +1,107 @@
+# tokenlore-Server (Apache): Einstieg, Sperren, Umschreiben und Header.
+# Ohne mod_rewrite geht alles weiter über index.php/… (z. B. …/index.php/api/me).
+
+DirectoryIndex index.php
+
+# Der Geräteschlüssel (Authorization: Bearer) erreicht PHP bei CGI/FastCGI sonst nicht, auch ohne mod_rewrite.
+# PHP liest HTTP_AUTHORIZATION oder REDIRECT_HTTP_AUTHORIZATION.
+<IfModule mod_setenvif.c>
+    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+</IfModule>
+<IfModule mod_version.c>
+    <IfVersion >= 2.4.13>
+        CGIPassAuth On
+    </IfVersion>
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Der Geräteschlüssel (Authorization: Bearer) erreicht PHP bei CGI/FastCGI nur über die Umgebung.
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Code, Daten, Tests und Skripte nie ausliefern (zusätzlich sperrt je eine .htaccess in app/ und tests/).
+    RewriteRule ^(app|data|tests|vendor|scripts)(/|$) - [F,L]
+
+    # Versteckte Pfade (.git, .env, jedes Segment mit führendem Punkt) nie ausliefern, außer .well-known.
+    # Ohne mod_rewrite sperren sie die Blöcke weiter unten (FilesMatch, RedirectMatch).
+    RewriteRule (^|/)\.(?!well-known(/|$)) - [F,L]
+
+    # index.html nie direkt ausliefern: Apache gäbe sie ohne CSP heraus. index.php liefert sie mit CSP.
+    RewriteRule ^index\.html$ index.php [L]
+
+    RewriteRule ^api/ index.php [L]
+    RewriteRule ^healthz$ index.php [L]
+
+    # Alles andere, was keine Datei und kein Ordner ist (etwa alte Seitenadressen wie /models), an index.php:
+    # die Webseite leitet es auf die Hash-Route um. Die Sperren oben greifen vorher.
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# Ohne mod_rewrite: index.html sperren (sie bekäme sonst keine CSP). Die Startseite kommt über index.php.
+<IfModule !mod_rewrite.c>
+    <Files "index.html">
+        <IfModule mod_authz_core.c>
+            Require all denied
+        </IfModule>
+        <IfModule !mod_authz_core.c>
+            Order deny,allow
+            Deny from all
+        </IfModule>
+    </Files>
+</IfModule>
+
+# Versteckte Dateien (.env, .htpasswd, …) nie ausliefern, mit und ohne mod_rewrite (.well-known ist ein Ordner und
+# keine Datei, die hier greift).
+<FilesMatch "^\.(?!well-known$)">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order deny,allow
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Ohne mod_rewrite: auch Dateien in versteckten Ordnern (.git/config) sperren. FilesMatch sieht nur den Dateinamen;
+# RedirectMatch prüft den ganzen Pfad. 404 statt 403 verrät nicht, ob es den Ordner gibt.
+# Fehlen mod_rewrite UND mod_alias, ist ein Ordner wie .git/ offen (nur Dateien mit führendem Punkt sperrt FilesMatch):
+# solche Ordner nie hochladen (docs/betrieb.md, Abschnitt 3).
+<IfModule !mod_rewrite.c>
+    <IfModule mod_alias.c>
+        RedirectMatch 404 "(^|/)\.(?!well-known(/|$))"
+    </IfModule>
+</IfModule>
+
+# Datenbankdateien (auch WAL und Sicherungen) nie ausliefern, wo auch immer sie liegen.
+<FilesMatch "\.(sqlite3?|db)(-wal|-shm|-journal)?$|\.bak$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order deny,allow
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+<IfModule mod_headers.c>
+    # Sicherheits-Header für Dateien, die Apache selbst ausliefert (alles außer *.php). Antworten von
+    # index.php bekommen sie vom Kernel; hier noch einmal gesetzt, stünden sie doppelt in der Antwort
+    # („always“ schreibt in eine eigene Tabelle neben den Headern von PHP). Die CSP setzt nur PHP
+    # (HTML-Antworten brauchen Hashes für Inline-Skripte).
+    <FilesMatch "(?i)^(?!.*\.php$)">
+        Header set Strict-Transport-Security "max-age=31536000"
+        Header set X-Content-Type-Options "nosniff"
+        Header set Referrer-Policy "no-referrer"
+        Header set Cross-Origin-Opener-Policy "same-origin"
+        Header set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    </FilesMatch>
+
+    # Dateien mit Hash im Namen ändern sich nie (wie _app/immutable/ in web.go).
+    <IfModule mod_setenvif.c>
+        SetEnvIf Request_URI "/_app/immutable/" TL_IMMUTABLE
+        Header set Cache-Control "public, max-age=31536000, immutable" env=TL_IMMUTABLE
+    </IfModule>
+</IfModule>
