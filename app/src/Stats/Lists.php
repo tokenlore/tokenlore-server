@@ -9,8 +9,8 @@ use Tokenlore\Db\Database;
 use Tokenlore\Util\Sql;
 use Tokenlore\Util\Time;
 
-// Listen je Nutzer (wie internal/stats/lists.go): Modelle, Konten, Anfragen ohne Konto je Gerät, Summen je Gerät.
-// Die Felder entsprechen den JSON-Antworten von /api/models, /api/accounts und /api/accounts/unknown.
+// Listen je Nutzer (wie internal/stats/lists.go): Modelle, Konten, Summen je Gerät.
+// Die Felder entsprechen den JSON-Antworten von /api/models und /api/accounts.
 final class Lists
 {
     public function __construct(private readonly Database $db)
@@ -76,28 +76,6 @@ final class Lists
                 from requests r where $where", array_merge([$uid], $args))->fetch(PDO::FETCH_ASSOC);
         // Schlüssel alphabetisch wie eine Go-Map.
         return ['accounts' => $accounts, 'unknown' => ['requests' => (int) $u['n'], 'sessions' => (int) $u['s'], 'tokens' => (int) $u['t']]];
-    }
-
-    /**
-     * Je Gerät die Anfragen ohne Konto mit erstem und letztem lokalen Tag der Arbeit.
-     *
-     * @return list<array{device_id:int,device_name:string,requests:int,first_date:string,last_date:string}>
-     */
-    public function unknownSources(int $uid): array
-    {
-        $out = [];
-        foreach (Sql::run($this->db->pdo(), 'select d.id, d.name, count(*) as n,
-                    min(' . Stats::LOCAL_DAY . ') as a, max(' . Stats::LOCAL_DAY . ') as b
-                  from requests r
-                  join devices d on d.id = r.device_id and d.user_id = r.user_id
-                 where r.user_id = ? and r.account_id is null
-                 group by d.id, d.name order by d.id', [$uid]) as $s) {
-            $out[] = [
-                'device_id' => (int) $s['id'], 'device_name' => $s['name'], 'requests' => (int) $s['n'],
-                'first_date' => $s['a'], 'last_date' => $s['b'],
-            ];
-        }
-        return $out;
     }
 
     /**

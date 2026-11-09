@@ -15,11 +15,12 @@ use Tokenlore\Http\Request;
 use Tokenlore\Http\Response;
 use Tokenlore\Http\Router;
 use Tokenlore\Protocol\Limits;
+use Tokenlore\Util\MediaType;
 use Tokenlore\Util\Names;
 use Tokenlore\Util\Time;
 
 // Geräte der angemeldeten Nutzer (internal/httpapi/device_handlers.go, manage_handlers.go): Kopplungscode erzeugen,
-// auflisten, sperren, umbenennen. Alle Routen verlangen Sitzung und CSRF-Token (bei GET entfällt es).
+// auflisten (mit Hinweisen zum Zusammenlegen), sperren, umbenennen, zusammenlegen. Alle Routen verlangen Sitzung und CSRF-Token (bei GET entfällt es).
 final class DeviceHandlers
 {
     private const NOT_FOUND = 'Gerät nicht gefunden';
@@ -30,12 +31,14 @@ final class DeviceHandlers
         private readonly ServerSettings $settings,
         private readonly Closure $clock,
         private readonly Audit $audit,
+        private readonly Closure $log,
     ) {
     }
 
     /**
      * @param (callable(): int)|null $clock Unix-Sekunden (Standard: time())
      * @param Audit|null $audit Sicherheitsprotokoll (Standard: error_log)
+     * @param (callable(string): void)|null $log Ziel für Fehlermeldungen (Standard: error_log)
      */
     public static function register(
         Router $router,
@@ -45,12 +48,34 @@ final class DeviceHandlers
         ServerSettings $settings,
         ?callable $clock = null,
         ?Audit $audit = null,
+        ?callable $log = null,
     ): void {
-        $h = new self($pairing, $devices, $settings, $clock === null ? time(...) : Closure::fromCallable($clock), $audit ?? new Audit());
+        $h = new self(
+            $pairing,
+            $devices,
+            $settings,
+            $clock === null ? time(...) : Closure::fromCallable($clock),
+            $audit ?? new Audit(),
+            $log === null ? static function (string $m): void {
+                error_log($m);
+            } : Closure::fromCallable($log),
+        );
         $session = static fn(callable $handler): callable => Middleware::chain($handler, $mw->requireSession(), $mw->requireCsrf());
-        $router->add('POST', '/api/devices/pair-codes', $session($h->pairCode(...)));
+        $router->add('POST', '/api/devices/pair-codes', Middleware::chain(
+            $h->pairCode(...),
+            $mw->requireSession(),
+            $mw->requireCsrf(),
+            $mw->maxBody(4096),
+        ));
         $router->add('GET', '/api/devices', $session($h->list(...)));
         $router->add('POST', '/api/devices/{id}/revoke', $session($h->revoke(...)));
+        $router->add('POST', '/api/devices/{id}/merge', Middleware::chain(
+            $h->merge(...),
+            $mw->requireSession(),
+            $mw->requireCsrf(),
+            $mw->jsonOnly(),
+            $mw->maxBody(4096),
+        ));
         $router->add('PUT', '/api/devices/{id}/name', Middleware::chain(
             $h->rename(...),
             $mw->requireSession(),
@@ -60,11 +85,35 @@ final class DeviceHandlers
         ));
     }
 
-    /** @param array<string,string> $params */
+    /**
+     * Neuer Kopplungscode. Rumpf leer: für ein neues Gerät oder das Gerät der Kennung. Rumpf {"device_id": n}
+     * (JSON): für dieses eigene Gerät, das beim Einlösen neu gekoppelt wird; fremd oder unbekannt: 404.
+     *
+     * @param array<string,string> $params
+     */
     private function pairCode(Request $r, array $params): Response
     {
-        $c = $this->pairing->newCode((int) $r->attr('uid'), ($this->clock)());
-        $this->audit->request($r, 'kopplungscode', (int) $r->attr('uid'));
+        $deviceId = null;
+        if (trim($r->body) !== '') {
+            if (MediaType::parse($r->header('content-type') ?? '') !== 'application/json') {
+                return Response::error(415, 'Content-Type muss application/json sein');
+            }
+            [$body] = StrictJson::decode($r->body, ['device_id' => 'int']);
+            if ($body === null) {
+                return Response::error(400, 'Ungültige Anfrage');
+            }
+            if (isset($body['device_id'])) {
+                $deviceId = $body['device_id'];
+                if ($deviceId < 1) {
+                    return Response::error(404, self::NOT_FOUND);
+                }
+            }
+        }
+        $c = $this->pairing->newCode((int) $r->attr('uid'), ($this->clock)(), $deviceId);
+        if ($c === null) {
+            return Response::error(404, self::NOT_FOUND);
+        }
+        $this->audit->request($r, 'kopplungscode', (int) $r->attr('uid'), $deviceId === null ? [] : ['geraet' => $deviceId]);
         $fingerprint = $this->settings->caFingerprint();
         // Gleicher Wortlaut wie „admin pair-code“; --ca nur mit hinterlegtem Zertifikat.
         $command = '/tokenlore:connect ' . BaseUrl::effective($r, $this->settings->publicUrl(), $this->settings->trustProxy())
@@ -74,13 +123,56 @@ final class DeviceHandlers
             'expires_at' => Time::isoMs($c['expires_at'] * 1000),
             'ca_fingerprint' => $fingerprint,
             'command' => $command,
+            'device' => $c['device'],
         ]);
     }
 
-    /** @param array<string,string> $params */
+    /**
+     * Geräte des Nutzers und Hinweise zum Zusammenlegen: {"devices": [...], "merge_hints": [{"from": B, "into": A}]}.
+     * Scheitert das Berechnen der Hinweise, kommt die Liste trotzdem, mit leeren Hinweisen; der Fehler geht ins Log.
+     *
+     * @param array<string,string> $params
+     */
     private function list(Request $r, array $params): Response
     {
-        return Response::json(200, $this->devices->list((int) $r->attr('uid')));
+        $uid = (int) $r->attr('uid');
+        $devices = $this->devices->list($uid);
+        try {
+            $hints = $this->devices->mergeCandidates($uid);
+        } catch (\Throwable $e) {
+            // Wie Kernel::handle: nach außen nichts, die Ursache ins Fehlerprotokoll.
+            ($this->log)(sprintf('Hinweise zum Zusammenlegen: %s: %s in %s:%d', $e::class, $e->getMessage(), $e->getFile(), $e->getLine()));
+            $hints = [];
+        }
+        return Response::json(200, ['devices' => $devices, 'merge_hints' => $hints]);
+    }
+
+    /**
+     * Legt das Gerät aus dem Rumpf {"from": B} in das Gerät {id} (A) zusammen. B gleich A: 400; eines davon
+     * unbekannt oder fremd: 404.
+     *
+     * @param array<string,string> $params
+     */
+    private function merge(Request $r, array $params): Response
+    {
+        [$body] = StrictJson::decode($r->body, ['from' => 'int']);
+        if ($body === null || !isset($body['from'])) {
+            return Response::error(400, 'Ungültige Anfrage');
+        }
+        $into = self::deviceId($params['id'] ?? '');
+        $from = $body['from'];
+        if ($into === null || $from < 1) {
+            return Response::error(404, self::NOT_FOUND);
+        }
+        if ($into === $from) {
+            return Response::error(400, 'Ein Gerät lässt sich nicht mit sich selbst zusammenlegen');
+        }
+        $uid = (int) $r->attr('uid');
+        if (!$this->devices->merge($uid, $into, $from)) {
+            return Response::error(404, self::NOT_FOUND);
+        }
+        $this->audit->request($r, 'geraete_zusammengelegt', $uid, ['geraet' => $into, 'von' => $from]);
+        return Response::empty();
     }
 
     /** @param array<string,string> $params */

@@ -17,6 +17,7 @@ use Tokenlore\Handlers\AuthHandlers;
 use Tokenlore\Handlers\DeviceHandlers;
 use Tokenlore\Handlers\IngestHandlers;
 use Tokenlore\Handlers\ManageHandlers;
+use Tokenlore\Handlers\OldDatabaseHandlers;
 use Tokenlore\Handlers\RecoveryHandlers;
 use Tokenlore\Handlers\SetupHandlers;
 use Tokenlore\Handlers\StatsHandlers;
@@ -34,7 +35,8 @@ use Tokenlore\Setup\Setup;
 // selbst, ohne Datenbank. $installDir, $audit und $setupFetch setzen nur Tests (Installation im Temp-Ordner,
 // Protokoll-Fake, Abrufer für die Selbstprüfungen der Einrichtung).
 //
-// Ohne Datenbank oder ohne Konto fehlt die Einrichtung: die API antwortet 503, Seiten zeigen die Einrichtung.
+// Ohne Datenbank oder ohne Konto fehlt die Einrichtung: die API antwortet 503, Seiten zeigen die Einrichtung. Eine
+// Datenbank vom Stand vor dem Plugin-Archiv bekommt statt Fehlern eine Seite mit den Schritten zum Neueinrichten.
 return static function (
     Router $router,
     Request $request,
@@ -49,7 +51,14 @@ return static function (
     $file = $paths->databaseFile();
     $db = $file === null ? null : Database::open($file);
     if ($db !== null) {
-        (new Migrator($db, $paths))->migrate();
+        $migrator = new Migrator($db, $paths);
+        // Stand vor dem Plugin-Archiv: nichts umstellen, nur die Schritte zeigen.
+        if ($migrator->isPreArchive()) {
+            $db->close();
+            OldDatabaseHandlers::register($router);
+            return;
+        }
+        $migrator->migrate();
     }
 
     if ($db === null || (int) $db->pdo()->query('select exists (select 1 from users)')->fetchColumn() === 0) {
@@ -76,7 +85,7 @@ return static function (
     PluginHandlers::register($router, $mw, $pairing, $settings, null, $audit);
     IngestHandlers::register($router, $mw, $db, $limiter, $nowMs, $audit);
     StatsHandlers::register($router, $mw, $db);
-    ManageHandlers::register($router, $mw, $db, null, $audit);
+    ManageHandlers::register($router, $mw, $db, $audit);
 
     // Team-Verwaltung mit denselben Instanzen wie die Middleware (Uhr: Standard, wie dort).
     AdminHandlers::register($router, $mw, $db, $sessions, $users, $settings, null, $audit);

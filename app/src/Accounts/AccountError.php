@@ -7,7 +7,7 @@ namespace Tokenlore\Accounts;
 use RuntimeException;
 
 // Fehler der Kontoverwaltung (wie ErrNotFound und ErrInvalid in internal/accounts):
-// NOT_FOUND gilt für unbekannte oder fremde Geräte, Konten und Zuordnungen, INVALID für Zeitraum, Kennung oder Namen.
+// NOT_FOUND gilt für unbekannte oder fremde Konten, INVALID für ungültige Namen.
 final class AccountError extends RuntimeException
 {
     public const NOT_FOUND = 'not_found';

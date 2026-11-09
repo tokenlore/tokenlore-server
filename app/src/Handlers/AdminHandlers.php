@@ -36,9 +36,13 @@ final class AdminHandlers
     private const ID_PATTERN = '/^[1-9][0-9]{0,15}\z/';
 
     private readonly Closure $clock;
+    private readonly Closure $extensionLoaded;
     private readonly Members $members;
 
-    /** @param callable(): int $clock */
+    /**
+     * @param callable(): int $clock
+     * @param callable(string): bool $extensionLoaded
+     */
     private function __construct(
         private readonly Database $db,
         private readonly Sessions $sessions,
@@ -46,14 +50,17 @@ final class AdminHandlers
         private readonly ServerSettings $settings,
         callable $clock,
         private readonly Audit $audit,
+        callable $extensionLoaded,
     ) {
         $this->clock = Closure::fromCallable($clock);
+        $this->extensionLoaded = Closure::fromCallable($extensionLoaded);
         $this->members = new Members($db);
     }
 
     /**
      * @param (callable(): int)|null $clock Unix-Sekunden (Standard: time()); dieselbe Uhr wie die Middleware
      * @param Audit|null $audit Sicherheitsprotokoll (Standard: error_log); jede gelungene Änderung, nur mit IDs
+     * @param (callable(string): bool)|null $extensionLoaded Prüfung auf PHP-Erweiterungen (Standard: extension_loaded; Tests)
      */
     public static function register(
         Router $router,
@@ -64,8 +71,9 @@ final class AdminHandlers
         ServerSettings $settings,
         ?callable $clock = null,
         ?Audit $audit = null,
+        ?callable $extensionLoaded = null,
     ): void {
-        $h = new self($db, $sessions, $users, $settings, $clock ?? time(...), $audit ?? new Audit());
+        $h = new self($db, $sessions, $users, $settings, $clock ?? time(...), $audit ?? new Audit(), $extensionLoaded ?? extension_loaded(...));
         $admin = static fn(callable $handler, callable ...$more): callable
             => Middleware::chain($handler, $mw->requireSession(), $mw->requireCsrf(), $mw->requireAdmin(), ...$more);
         $json = [$mw->jsonOnly(), $mw->maxBody(self::MAX_BODY)];
@@ -202,6 +210,8 @@ final class AdminHandlers
             'detected_url' => BaseUrl::detect($r, $this->settings->trustProxy()),
             'trust_proxy' => $this->settings->trustProxy(),
             'ca_fingerprint' => $fp === '' ? null : $fp,
+            // Ohne Sodium prüft der Server keine Signaturen der Plugins; die Seite zeigt dann die Anleitung.
+            'sodium' => ($this->extensionLoaded)('sodium'),
         ]);
     }
 

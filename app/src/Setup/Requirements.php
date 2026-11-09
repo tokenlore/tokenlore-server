@@ -21,6 +21,7 @@ final class Requirements
     public const OPENSSL = 'PHP-Erweiterung openssl';
     public const MBSTRING = 'PHP-Erweiterung mbstring';
     public const CTYPE = 'PHP-Erweiterung ctype';
+    public const SODIUM = 'PHP-Erweiterung sodium';
     public const SQLITE_VERSION = 'SQLite-Version';
     public const SQLITE_JSON = 'SQLite-JSON-Funktionen';
     public const ARGON2ID = 'Passwort-Verfahren Argon2id';
@@ -32,7 +33,7 @@ final class Requirements
 
     /** Ohne diese Punkte kann der Server nicht arbeiten. */
     public const CRITICAL = [
-        self::PHP, self::SQLITE, self::JSON, self::OPENSSL, self::MBSTRING, self::CTYPE,
+        self::PHP, self::SQLITE, self::JSON, self::OPENSSL, self::MBSTRING, self::CTYPE, self::SODIUM,
         self::SQLITE_VERSION, self::SQLITE_JSON, self::ARGON2ID, self::DATA_DIR,
     ];
 
@@ -83,6 +84,16 @@ final class Requirements
                     . 'einschalten (in Plesk: „PHP-Einstellungen“, Bereich „Erweiterungen“). Ohne sie läuft tokenlore nicht.',
             );
         }
+
+        // Sodium gehört zu PHP, lässt sich beim Hoster aber abschalten; ohne sie prüft der Server keine Signaturen.
+        $out[] = self::row(
+            self::SODIUM,
+            (bool) $env('ext:sodium'),
+            'Vorhanden. Damit prüft tokenlore die Signaturen der Plugins.',
+            'Die PHP-Erweiterung sodium fehlt. Damit prüft tokenlore die Signaturen der Plugins. So geht’s: '
+                . 'im Hoster-Menü unter „PHP-Einstellungen“ die Erweiterung sodium anschalten (in Plesk im Bereich „Erweiterungen“) '
+                . 'und die Seite neu laden. Ohne sie läuft tokenlore nicht.',
+        );
 
         $sqlite = $env('sqlite_version');
         $sqlite = is_string($sqlite) ? $sqlite : '';

@@ -6,23 +6,25 @@ namespace Tokenlore\Ingest;
 
 use stdClass;
 use Tokenlore\Protocol\Limits;
+use Tokenlore\Protocol\Signature;
 use Tokenlore\Protocol\Validator;
 
-// Liest und prüft Lieferpakete wie internal/ingest/decode.go und validate.go: gleiche Reihenfolge der Prüfungen,
-// gleiche Pfade und Meldungen. Fehler nennen nur den Feldpfad und was daran falsch ist, nie den Wert.
+// Liest und prüft Lieferpakete (Protokoll Version 2, protocol/doc.md im Plugin-Repo) in der Reihenfolge der
+// „Prüfregeln des Servers“: Mindestversion (426), Paketform und Grenzen, Signatur je Zeile, Inhaltszeile (je 400 mit
+// Pfad). Fehler nennen nur den Feldpfad und was daran falsch ist, nie den Wert.
 //
 // JSON wird mit Objekten statt assoziativen Arrays dekodiert. Nur so bleiben {} und [] unterscheidbar, und ein
-// Objekt mit den Schlüsseln "0", "1" (z. B. Werkzeuge namens "0") wird nicht für eine Liste gehalten. Go lehnt
-// Listen an Stellen für Objekte ab und nimmt solche Objekte an; der Dekodierer tut dasselbe, ohne den Rohtext
-// selbst zu zerlegen. Danach kommen die Daten als Arrays in festen Formen heraus (siehe decode()).
+// Objekt mit den Schlüsseln "0", "1" (z. B. Werkzeuge namens "0") wird nicht für eine Liste gehalten. Feldnamen des
+// Pakets passen wie bei Gos encoding/json auch ohne Beachtung der Groß-/Kleinschreibung; die Hüllen und die signierten
+// Inhaltszeilen dagegen nur mit genau den Schlüsseln aus dem Protokoll.
 final class Decoder
 {
-    /** Protokollversion, die jede Lieferung trägt (protocol.Version). */
-    public const VERSION = 1;
+    /** Protokollversion, die jede Lieferung trägt. */
+    public const VERSION = Limits::PROTOCOL_VERSION;
 
     public const TYPE_ERROR = Validator::TYPE_ERROR;
 
-    // Kontenliste: Grenze vor dem Dekodieren der Elemente (maxAccounts in decode.go).
+    // Kontenliste: Grenze vor dem Dekodieren der Elemente.
     private const MAX_ACCOUNTS = 1000;
 
     // Höchste Schachtelungstiefe; Gos Dekodierer bricht ab 10.000 Ebenen mit einem Syntaxfehler ab.
@@ -30,50 +32,39 @@ final class Decoder
 
     private const WS = " \t\n\r";
 
-    // Felder der Strukturen aus https://github.com/tokenlore/tokenlore/blob/main/protocol/protocol.go mit ihrem Typ.
+    // Felder der Strukturen mit ihrem Typ.
     private const DEVICE = ['os' => 'string', 'arch' => 'string', 'tz' => 'string', 'plugin_version' => 'string'];
     private const ACCOUNT = ['account_id' => 'string', 'email_mode' => 'string', 'email' => 'string'];
-    private const SESSION = ['session_id' => 'string', 'project_id' => 'string', 'cc_version' => 'string', 'account_id' => 'string'];
-    private const REQUEST = [
-        'request_id' => 'string', 'message_id' => 'string', 'session_id' => 'string', 'ts' => 'time',
-        'utc_offset_min' => 'int', 'model' => 'string',
-        'input' => 'int', 'output' => 'int', 'cache_create' => 'int', 'cache_read' => 'int',
-        'cache_1h' => 'int', 'cache_5m' => 'int', 'thinking' => 'int', 'web_search' => 'int', 'web_fetch' => 'int',
-        'stop_reason' => 'string', 'subagent' => 'bool', 'tools' => 'intmap', 'account_id' => 'string', 'extra' => 'anymap',
-    ];
-    private const LEGACY_MODEL = ['date' => 'string', 'model' => 'string', 'tokens' => 'int'];
-    private const LEGACY_ACTIVITY = ['date' => 'string', 'messages' => 'int', 'sessions' => 'int', 'tool_calls' => 'int'];
+    private const SESSION = ['session_id' => 'string', 'cc_version' => 'string', 'account_id' => 'string'];
 
-    // Listen in der Reihenfolge, in der Go ihre Elemente dekodiert.
+    // Listen in der Reihenfolge, in der ihre Elemente dekodiert werden; null steht für Hüllen (z, s).
     private const LISTS = [
         'accounts' => self::ACCOUNT,
         'sessions' => self::SESSION,
-        'requests' => self::REQUEST,
-        'legacy_model' => self::LEGACY_MODEL,
-        'legacy_activity' => self::LEGACY_ACTIVITY,
+        'requests' => null,
+        'legacy_days' => null,
     ];
 
-    // Listengrenzen in der Reihenfolge, in der Go sie vor den Elementen prüft.
+    // Listengrenzen in der Reihenfolge, in der sie vor den Elementen geprüft werden.
     private const LIST_LIMITS = [
         'requests' => Limits::MAX_REQUESTS_PER_BATCH,
-        'legacy_model' => Limits::MAX_LEGACY_LIST,
-        'legacy_activity' => Limits::MAX_LEGACY_LIST,
+        'legacy_days' => Limits::MAX_LEGACY_LIST,
         'accounts' => self::MAX_ACCOUNTS,
         'sessions' => Limits::MAX_SESSIONS_PER_BATCH,
     ];
 
-    // Nullzeit (0001-01-01T00:00:00Z) in Millisekunden, wie ein fehlendes ts in Go.
-    private const ZERO_TIME_MS = -62_135_596_800_000;
-
     /**
-     * Liest genau ein Paket-Objekt. Unbekannte Felder, falsche Typen und Text nach dem Objekt sind Fehler.
-     * Feldnamen passen wie in Go auch ohne Beachtung der Groß-/Kleinschreibung; null gilt als Nullwert.
-     * Ergebnis: v, device (os, arch, tz, plugin_version) und die Listen accounts, sessions, requests, legacy_model,
-     * legacy_activity, jedes Element mit allen Feldern ("", 0, false, []). Anfragen tragen zusätzlich ts_ms
-     * (Millisekunden seit 1970, UTC); ts bleibt der gelieferte Text für die Prüfung. Die Rumpfgrenze setzt der Aufrufer.
+     * Liest genau ein Paket-Objekt. Zuerst die Mindestversion: ist device.plugin_version älter als
+     * Limits::MIN_PLUGIN_VERSION (oder fehlt sie), folgt PluginOutdated vor jeder weiteren Prüfung, damit auch ein
+     * altes Plugin mit anderer Paketform die Meldung „aktualisieren“ bekommt. Danach sind unbekannte Felder, falsche
+     * Typen und Text nach dem Objekt Fehler; null gilt als Nullwert.
+     * Ergebnis: v, device (os, arch, tz, plugin_version) und die Listen accounts und sessions (jedes Element mit allen
+     * Feldern, "" wenn nicht da) sowie requests und legacy_days als Hüllen ['z' => Text, 's' => Text oder null].
+     * Die Rumpfgrenze setzt der Aufrufer.
      *
      * @return array<string, mixed>
      * @throws IngestError
+     * @throws PluginOutdated
      */
     public static function decode(string $body): array
     {
@@ -92,9 +83,13 @@ final class Decoder
         if (!$top instanceof stdClass) {
             throw new IngestError('', self::TYPE_ERROR);
         }
+        $version = self::pluginVersion($top);
+        if ($version !== null && Validator::pluginOutdated($version)) {
+            throw new PluginOutdated();
+        }
 
-        // Erste Stufe: Listen bleiben unzerlegt, damit ihre Länge vor den Elementen geprüft wird. Wie Go merkt sich
-        // der Durchlauf den ersten Fehler in Dokumentreihenfolge; ein Listenfehler (Gos UnmarshalJSON) bricht sofort ab.
+        // Erste Stufe: Listen bleiben unzerlegt, damit ihre Länge vor den Elementen geprüft wird. Der Durchlauf merkt
+        // sich den ersten Fehler in Dokumentreihenfolge; ein Listenfehler bricht sofort ab.
         $batch = ['v' => 0, 'device' => self::zero(self::DEVICE)];
         $raw = [];
         $saved = null;
@@ -112,7 +107,7 @@ final class Decoder
                 } elseif ($value !== null) {
                     $saved ??= new IngestError('device', self::TYPE_ERROR);
                 }
-            } elseif (isset(self::LISTS[$name])) {
+            } elseif (array_key_exists($name, self::LISTS)) {
                 if ($value !== null && !is_array($value)) {
                     throw new IngestError($name, self::TYPE_ERROR);
                 }
@@ -141,6 +136,10 @@ final class Decoder
             $out = [];
             foreach ($raw[$name] ?? [] as $i => $el) {
                 $path = $name . '[' . $i . ']';
+                if ($spec === null) {
+                    $out[] = self::envelope($el, $path);
+                    continue;
+                }
                 $item = self::zero($spec);
                 if ($el !== null) {
                     if (!$el instanceof stdClass) {
@@ -161,14 +160,20 @@ final class Decoder
     }
 
     /**
-     * Prüft ein dekodiertes Paket und wirft den ersten Fehler. Jedes Element geht durch dieselbe Regel wie beim
-     * Plugin (Protocol\Validator); hier wird nur der genaue Pfad bestimmt (Validate in validate.go).
+     * Prüft ein dekodiertes Paket und liest die signierten Zeilen. Reihenfolge laut „Prüfregeln des Servers“: erst
+     * Paketform und Grenzen (Version, Gerät, Konten, Sitzungen, Hüllen), dann die Signatur jeder Zeile gegen $signKeys,
+     * dann jede Inhaltszeile. Der erste Fehler bricht ab.
+     *
+     * Ergebnis: das Paket, in dem requests die gelesenen Anfragen (Validator::requestLine) und legacy_days die
+     * gelesenen Tage (Validator::dayLine) sind, je mit z und s wie geliefert.
      *
      * @param array<string, mixed> $b Ergebnis von decode()
      * @param int $nowMs Uhr des Servers in Millisekunden
+     * @param list<string> $signKeys Signaturschlüssel des liefernden Geräts (Devices::signKeys), 32 Byte roh
+     * @return array<string, mixed>
      * @throws IngestError
      */
-    public static function validate(array $b, int $nowMs): void
+    public static function validate(array $b, int $nowMs, array $signKeys): array
     {
         if ($b['v'] !== self::VERSION) {
             throw new IngestError('v', 'Protokollversion nicht unterstützt');
@@ -184,49 +189,138 @@ final class Decoder
                 throw self::fieldError("accounts[$i]", $err, ['account_id', 'email_mode']);
             }
         }
-        if (count($b['sessions']) > Limits::MAX_SESSIONS_PER_BATCH) {
-            throw new IngestError('sessions', 'mehr als ' . Limits::MAX_SESSIONS_PER_BATCH . ' Einträge');
-        }
         foreach ($b['sessions'] as $i => $s) {
             $err = Validator::session($s);
             if ($err !== null) {
-                throw self::fieldError("sessions[$i]", $err, ['session_id', 'project_id', 'cc_version', 'account_id']);
+                throw self::fieldError("sessions[$i]", $err, ['session_id', 'cc_version', 'account_id']);
             }
         }
-        if (count($b['requests']) > Limits::MAX_REQUESTS_PER_BATCH) {
-            throw new IngestError('requests', 'mehr als ' . Limits::MAX_REQUESTS_PER_BATCH . ' Anfragen');
-        }
-        foreach ($b['requests'] as $i => $r) {
-            $err = Validator::request(self::forValidator($r), $nowMs);
-            if ($err !== null) {
-                throw self::requestError("requests[$i]", $r, $err);
+        foreach (['requests', 'legacy_days'] as $list) {
+            foreach ($b[$list] as $i => $e) {
+                if (strlen($e['z']) > Limits::MAX_LINE_BYTES) {
+                    throw new IngestError("{$list}[$i].z", 'länger als ' . Limits::MAX_LINE_BYTES . ' Byte');
+                }
+                if (!mb_check_encoding($e['z'], 'UTF-8')) {
+                    throw new IngestError("{$list}[$i].z", 'kein gültiges UTF-8');
+                }
             }
         }
-        foreach (['legacy_model', 'legacy_activity'] as $list) {
-            if (count($b[$list]) > Limits::MAX_LEGACY_LIST) {
-                throw new IngestError($list, 'mehr als ' . Limits::MAX_LEGACY_LIST . ' Einträge');
+
+        // Signatur: der zuletzt passende Schlüssel wird zuerst versucht (meist passt für alle Zeilen derselbe).
+        $order = $signKeys;
+        foreach (['requests', 'legacy_days'] as $list) {
+            foreach ($b[$list] as $i => $e) {
+                $path = "{$list}[$i].s";
+                if ($e['s'] === null) {
+                    throw new IngestError($path, 'Signatur fehlt');
+                }
+                $sig = Signature::decode($e['s']);
+                if ($sig === null) {
+                    throw new IngestError($path, 'Signatur ungültig');
+                }
+                $hit = Signature::matchingKey($e['z'], $sig, $order);
+                if ($hit === null) {
+                    throw new IngestError($path, 'Signatur passt zu keinem Schlüssel des Geräts', 400, IngestError::REASON_SIGN_KEY_UNKNOWN);
+                }
+                if ($hit !== 0) {
+                    $key = $order[$hit];
+                    unset($order[$hit]);
+                    array_unshift($order, $key);
+                }
             }
         }
-        foreach ($b['legacy_model'] as $i => $d) {
-            $err = Validator::legacyModel($d, $nowMs);
-            if ($err !== null) {
-                throw self::fieldError("legacy_model[$i]", $err, ['date', 'model', 'tokens']);
+
+        foreach (['requests' => 'requestLine', 'legacy_days' => 'dayLine'] as $list => $check) {
+            $rows = [];
+            foreach ($b[$list] as $i => $e) {
+                $path = "{$list}[$i].z";
+                try {
+                    $line = json_decode($e['z'], false, 64, JSON_THROW_ON_ERROR);
+                } catch (\JsonException) {
+                    throw new IngestError($path, 'kein gültiges JSON');
+                }
+                $err = self::lineForm($e['z']);
+                if ($err !== null) {
+                    throw new IngestError(self::join($path, $err[0]), $err[1]);
+                }
+                $err = Validator::$check($line, $nowMs, $out);
+                if ($err !== null) {
+                    throw new IngestError(self::join($path, $err[0]), $err[1]);
+                }
+                $rows[] = $out + ['z' => $e['z'], 's' => $e['s']];
             }
+            $b[$list] = $rows;
         }
-        foreach ($b['legacy_activity'] as $i => $d) {
-            $err = Validator::legacyActivity($d, $nowMs);
-            if ($err !== null) {
-                throw self::fieldError("legacy_activity[$i]", $err, ['date', 'messages', 'sessions', 'tool_calls']);
-            }
-        }
+        return $b;
     }
 
     /**
-     * Dekodiert ein Objekt in die Felder von $spec (wie encoding/json in eine Struktur). Unbekannte Felder und
-     * Typfehler merkt sich $saved (nur der erste zählt); ein ungültiges ts bricht sofort ab, weil Gos
-     * time.Time.UnmarshalJSON seinen Fehler direkt zurückgibt ("Paket nicht lesbar").
+     * device.plugin_version, gelesen ohne die übrigen Prüfungen (Name ohne Beachtung der Groß-/Kleinschreibung wie
+     * beim Dekodieren): "" wenn Gerät oder Version fehlen oder null sind, null wenn ein Wert den falschen Typ hat
+     * (das meldet danach die Formprüfung).
+     */
+    private static function pluginVersion(stdClass $top): ?string
+    {
+        $version = '';
+        foreach (get_object_vars($top) as $key => $device) {
+            if (strtolower((string) $key) !== 'device') {
+                continue;
+            }
+            $version = '';
+            if ($device === null) {
+                continue;
+            }
+            if (!$device instanceof stdClass) {
+                return null;
+            }
+            foreach (get_object_vars($device) as $field => $v) {
+                if (strtolower((string) $field) !== 'plugin_version' || $v === null) {
+                    continue;
+                }
+                if (!is_string($v)) {
+                    return null;
+                }
+                $version = $v;
+            }
+        }
+        return $version;
+    }
+
+    /**
+     * Liest eine Hülle: ein Objekt mit genau den Schlüsseln z (Text, Pflicht) und s (Text; fehlt s, meldet das die
+     * Signaturprüfung mit ihrem Pfad).
      *
-     * @param array<string, string> $spec
+     * @return array{z: string, s: string|null}
+     */
+    private static function envelope(mixed $el, string $path): array
+    {
+        if (!$el instanceof stdClass) {
+            throw new IngestError($path, self::TYPE_ERROR);
+        }
+        $v = get_object_vars($el);
+        foreach ($v as $k => $_) {
+            if ($k !== 'z' && $k !== 's') {
+                throw new IngestError($path, 'unbekanntes Feld');
+            }
+        }
+        if (!isset($v['z'])) {
+            throw new IngestError("$path.z", 'fehlt');
+        }
+        if (!is_string($v['z'])) {
+            throw new IngestError("$path.z", self::TYPE_ERROR);
+        }
+        $s = $v['s'] ?? null;
+        if ($s !== null && !is_string($s)) {
+            throw new IngestError("$path.s", self::TYPE_ERROR);
+        }
+        return ['z' => $v['z'], 's' => $s];
+    }
+
+    /**
+     * Dekodiert ein Objekt in die Textfelder von $spec (wie encoding/json in eine Struktur). Unbekannte Felder und
+     * Typfehler merkt sich $saved (nur der erste zählt); null lässt den Wert unverändert.
+     *
+     * @param array<string, string> $spec Feld => 'string'
      * @param array<string, mixed> $into Nullwerte bzw. bisheriger Stand
      * @return array<string, mixed>
      */
@@ -234,131 +328,26 @@ final class Decoder
     {
         foreach (get_object_vars($o) as $key => $v) {
             $field = strtolower((string) $key);
-            $type = $spec[$field] ?? null;
-            if ($type === null) {
+            if (!isset($spec[$field])) {
                 $saved ??= new IngestError($path, 'unbekanntes Feld');
                 continue;
             }
-            if ($type === 'time') {
-                if ($v === null) {
-                    continue;
-                }
-                $ms = is_string($v) ? self::parseTimestamp($v) : null;
-                if ($ms === null) {
-                    throw new IngestError($path, 'Paket nicht lesbar');
-                }
-                $into['ts'] = $v;
-                $into['ts_ms'] = $ms;
-                continue;
-            }
             if ($v === null) {
-                // null lässt Text, Zahl und Wahrheitswert unverändert und leert eine Map.
-                if ($type === 'intmap' || $type === 'anymap') {
-                    $into[$field] = [];
-                }
                 continue;
             }
-            $ok = match ($type) {
-                'string' => is_string($v),
-                'int' => is_int($v),
-                'bool' => is_bool($v),
-                'intmap', 'anymap' => $v instanceof stdClass,
-            };
-            if ($ok && $type === 'intmap') {
-                $map = [];
-                foreach (get_object_vars($v) as $name => $n) {
-                    if ($n !== null && !is_int($n)) {
-                        $ok = false;
-                        break;
-                    }
-                    $map[$name] = $n ?? 0;
-                }
-                $v = $map;
-            } elseif ($ok && $type === 'anymap') {
-                $v = get_object_vars($v);
-            }
-            if (!$ok) {
-                // Pfad endet bei tools und extra: ihre Schlüssel stammen aus der Eingabe (safePath).
+            if (!is_string($v)) {
                 $saved ??= new IngestError($typePrefix . '.' . $field, self::TYPE_ERROR);
                 continue;
             }
-            // Eine Map wird wie in Go ergänzt, nicht ersetzt, wenn das Feld doppelt vorkommt.
-            $into[$field] = is_array($v) ? array_replace($into[$field], $v) : $v;
+            $into[$field] = $v;
         }
         return $into;
     }
 
-    /** @param array<string, string> $spec @return array<string, mixed> */
+    /** @param array<string, string> $spec @return array<string, string> */
     private static function zero(array $spec): array
     {
-        $out = [];
-        foreach ($spec as $field => $type) {
-            if ($type === 'time') {
-                $out['ts'] = null;
-                $out['ts_ms'] = self::ZERO_TIME_MS;
-                continue;
-            }
-            $out[$field] = match ($type) {
-                'string' => '',
-                'int' => 0,
-                'bool' => false,
-                'intmap', 'anymap' => [],
-            };
-        }
-        return $out;
-    }
-
-    /**
-     * Validator erkennt Objekte an Arrays, die keine Liste sind. Werkzeuge oder extra mit den Schlüsseln "0", "1", …
-     * sind nach dem Dekodieren aber eine Liste. Für die Prüfung bekommen sie deshalb Ersatznamen; Ziffern sind
-     * gültige Werkzeug- und extra-Namen, das Prüfergebnis bleibt also gleich.
-     *
-     * @param array<string, mixed> $r
-     * @return array<string, mixed>
-     */
-    private static function forValidator(array $r): array
-    {
-        foreach (['tools' => 't', 'extra' => 'k'] as $field => $prefix) {
-            if ($r[$field] !== [] && array_is_list($r[$field])) {
-                $renamed = [];
-                foreach ($r[$field] as $i => $v) {
-                    $renamed[$prefix . $i] = $v;
-                }
-                $r[$field] = $renamed;
-            }
-        }
-        return $r;
-    }
-
-    /**
-     * Pfad eines Anfragefehlers (requestError in validate.go). Für Zahlen- und Listenfelder nennt der Validator kein
-     * einzelnes Feld; dort sucht der Server das Feld anhand derselben Grenzen.
-     *
-     * @param array<string, mixed> $r
-     */
-    private static function requestError(string $p, array $r, string $msg): IngestError
-    {
-        if (str_ends_with($msg, ': ' . self::TYPE_ERROR)) {
-            return self::fieldError($p, $msg, []);
-        }
-        if (str_starts_with($msg, 'Token-Wert')) {
-            foreach (['input', 'output', 'cache_create', 'cache_read', 'cache_1h', 'cache_5m', 'thinking'] as $f) {
-                if ($r[$f] < 0 || $r[$f] > Limits::MAX_TOKENS_PER_FIELD) {
-                    return new IngestError("$p.$f", 'außerhalb des Bereichs');
-                }
-            }
-        } elseif (str_starts_with($msg, 'web_search/web_fetch')) {
-            if ($r['web_search'] < 0 || $r['web_search'] > Limits::MAX_COUNT_PER_FIELD) {
-                return new IngestError("$p.web_search", 'außerhalb des Bereichs');
-            }
-            return new IngestError("$p.web_fetch", 'außerhalb des Bereichs');
-        } elseif (str_contains($msg, 'Werkzeug')) {
-            return new IngestError("$p.tools", $msg);
-        } elseif (str_contains($msg, 'extra')) {
-            $at = strpos($msg, 'extra-');
-            return new IngestError("$p.extra", $at === false ? $msg : substr_replace($msg, '', $at, strlen('extra-')));
-        }
-        return self::fieldError($p, $msg, ['message_id', 'request_id', 'session_id', 'account_id', 'model', 'ts', 'utc_offset_min', 'stop_reason']);
+        return array_fill_keys(array_keys($spec), '');
     }
 
     /**
@@ -391,7 +380,78 @@ final class Decoder
 
     private static function join(string $p, string $f): string
     {
-        return $p === '' ? $f : $p . '.' . $f;
+        return $p === '' || $f === '' ? $p . $f : $p . '.' . $f;
+    }
+
+    /**
+     * Form einer Inhaltszeile, die json_decode nicht sieht: kompakt (kein Leerraum außerhalb von Texten, so schreibt das
+     * Plugin z mit MarshalLine) und kein Schlüssel doppelt in einem Objekt, auf jeder Ebene. json_decode nähme bei
+     * doppelten Schlüsseln still den letzten Wert; ein anderer Leser von z sähe dann andere Werte als die Spalten.
+     * Erwartet gültiges JSON (nach json_decode). Ergebnis: null oder [Pfad in z, Meldung]; der Pfad nennt das Objekt,
+     * einen Schlüssel nur, wenn er Limits::EXTRA_KEY erfüllt (sonst endet er beim Objekt davor), nie den doppelten.
+     *
+     * @return array{0:string, 1:string}|null
+     */
+    private static function lineForm(string $z): ?array
+    {
+        $n = strlen($z);
+        for ($i = 0; $i < $n;) {
+            $j = $i + strcspn($z, '"' . self::WS, $i);
+            if ($j >= $n) {
+                break;
+            }
+            if ($z[$j] !== '"') {
+                return ['', 'nicht kompakt (Leerraum außerhalb von Texten)'];
+            }
+            $i = self::stringEnd($z, $j) ?? $n;
+        }
+        $i = 0;
+        return self::uniqueKeys($z, $i, '');
+    }
+
+    /**
+     * Prüft den Wert ab Position $i (kompaktes, gültiges JSON) auf doppelte Schlüssel und setzt $i hinter ihn.
+     *
+     * @return array{0:string, 1:string}|null
+     */
+    private static function uniqueKeys(string $z, int &$i, string $path): ?array
+    {
+        $c = $z[$i];
+        if ($c === '"') {
+            $i = (int) self::stringEnd($z, $i);
+            return null;
+        }
+        if ($c !== '{' && $c !== '[') {
+            $i += strcspn($z, ',]}', $i);
+            return null;
+        }
+        $i++;
+        $close = $c === '{' ? '}' : ']';
+        if ($z[$i] === $close) {
+            $i++;
+            return null;
+        }
+        $seen = [];
+        for ($n = 0;; $n++) {
+            $sub = $path . '[' . $n . ']';
+            if ($c === '{') {
+                $end = (int) self::stringEnd($z, $i);
+                $key = (string) json_decode(substr($z, $i, $end - $i));
+                if (isset($seen[$key])) {
+                    return [$path, 'doppelter Schlüssel'];
+                }
+                $seen[$key] = true;
+                $i = $end + 1; // hinter dem Doppelpunkt
+                $sub = preg_match(Limits::EXTRA_KEY, $key) === 1 ? self::join($path, $key) : $path;
+            }
+            $err = self::uniqueKeys($z, $i, $sub);
+            if ($err !== null) {
+                return $err;
+            }
+            if ($z[$i++] === $close) {
+                return null;
+            }
+        }
     }
 
     /**
@@ -452,50 +512,5 @@ final class Decoder
             }
             $i += 2;
         }
-    }
-
-    /**
-     * Liest einen RFC-3339-Zeitstempel wie Gos time.Time (gleiches Muster wie Protocol\Validator) und liefert
-     * Millisekunden seit 1970 in UTC (Bruchteile abgeschnitten); null, wenn er nicht passt.
-     */
-    private static function parseTimestamp(string $v): ?int
-    {
-        if (preg_match(
-            '/^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?(?:Z|([+-])([0-9]{2}):([0-9]{2}))\z/',
-            $v,
-            $m,
-        ) !== 1) {
-            return null;
-        }
-        [$y, $mo, $d, $h, $mi, $s] = [(int) $m[1], (int) $m[2], (int) $m[3], (int) $m[4], (int) $m[5], (int) $m[6]];
-        $leap = $y % 4 === 0 && ($y % 100 !== 0 || $y % 400 === 0);
-        $days = [31, $leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        if ($mo < 1 || $mo > 12 || $d < 1 || $d > $days[$mo - 1] || $h > 23 || $mi > 59 || $s > 59) {
-            return null;
-        }
-        $offset = 0;
-        if (isset($m[8]) && $m[8] !== '') {
-            $oh = (int) $m[9];
-            $om = (int) $m[10];
-            if ($oh > 23 || $om > 59) {
-                return null;
-            }
-            $offset = ($m[8] === '-' ? -1 : 1) * ($oh * 3600 + $om * 60);
-        }
-        $ms = (int) substr(str_pad($m[7] ?? '', 3, '0'), 0, 3);
-        return (self::daysFromCivil($y, $mo, $d) * 86400 + $h * 3600 + $mi * 60 + $s - $offset) * 1000 + $ms;
-    }
-
-    /** Tage seit 1970-01-01 im gregorianischen Kalender (Algorithmus von Howard Hinnant, wie im Validator). */
-    private static function daysFromCivil(int $y, int $m, int $d): int
-    {
-        if ($m <= 2) {
-            $y--;
-        }
-        $era = intdiv($y >= 0 ? $y : $y - 399, 400);
-        $yoe = $y - $era * 400;
-        $doy = intdiv(153 * ($m + ($m > 2 ? -3 : 9)) + 2, 5) + $d - 1;
-        $doe = $yoe * 365 + intdiv($yoe, 4) - intdiv($yoe, 100) + $doy;
-        return $era * 146097 + $doe - 719468;
     }
 }

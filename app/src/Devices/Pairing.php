@@ -9,10 +9,14 @@ use PDO;
 use PDOStatement;
 use RuntimeException;
 use Tokenlore\Db\Database;
+use Tokenlore\Protocol\Limits;
 
 // Kopplung per Kurzcode (devices/pairing.go). BEGIN IMMEDIATE ersetzt den globalen Advisory-Lock:
 // Erzeugen und Einlösen laufen nacheinander, Fehlversuche zählen global.
 // Zeiten sind Unix-Sekunden. Codes und Geräteschlüssel liegen nur als SHA-256 (roh, 32 Byte) in der Datenbank.
+// Ein Rechner bleibt je Benutzer ein Gerät: Die Kennung des Rechners (device_source) steht in device_sources; Koppeln
+// mit einer bekannten Kennung koppelt das Gerät neu, statt ein zweites anzulegen. Gespeichert wird die Kennung nur als
+// HMAC mit dem Salz des Benutzers (storedSource), sodass derselbe Rechner unter zwei Konten nicht verknüpfbar ist.
 final class Pairing
 {
     /** Gültigkeit eines Codes in Sekunden. */
@@ -35,13 +39,25 @@ final class Pairing
 
     /**
      * Erzeugt einen 6-stelligen Code; der vorherige aktive Code des Nutzers wird ungültig und kein aktiver
-     * Code wird doppelt vergeben. Räumt nebenbei lange abgelaufene Codes ab.
+     * Code wird doppelt vergeben. Räumt nebenbei lange abgelaufene Codes ab. Mit $deviceId gilt der Code für
+     * dieses Gerät des Nutzers (auch ein gesperrtes) und koppelt es beim Einlösen neu.
      *
-     * @return array{code:string, expires_at:int}
+     * @return array{code:string, expires_at:int, device:array{id:int, name:string}|null}|null null: $deviceId ist
+     *         kein Gerät dieses Nutzers (nichts geändert)
      */
-    public function newCode(int $uid, int $now): array
+    public function newCode(int $uid, int $now, ?int $deviceId = null): ?array
     {
-        return $this->db->tx(function (PDO $pdo) use ($uid, $now): array {
+        return $this->db->tx(function (PDO $pdo) use ($uid, $now, $deviceId): ?array {
+            $device = null;
+            if ($deviceId !== null) {
+                $dev = $pdo->prepare('select id, name from devices where id = ? and user_id = ?');
+                $dev->execute([$deviceId, $uid]);
+                $row = $dev->fetch(PDO::FETCH_ASSOC);
+                if ($row === false) {
+                    return null;
+                }
+                $device = ['id' => (int) $row['id'], 'name' => (string) $row['name']];
+            }
             $pdo->prepare('update pair_codes set used_at = ? where user_id = ? and used_at is null')->execute([$now, $uid]);
             $pdo->prepare('delete from pair_codes where expires_at < ?')->execute([$now - self::CLEANUP_AFTER]);
             $taken = $pdo->prepare(
@@ -55,28 +71,66 @@ final class Pairing
                     continue;
                 }
                 $expires = $now + self::CODE_TTL;
-                $ins = $pdo->prepare('insert into pair_codes (code_hash, user_id, expires_at) values (?, ?, ?)');
-                self::bindHash($ins, $hash, $uid, $expires)->execute();
-                return ['code' => $code, 'expires_at' => $expires];
+                $ins = $pdo->prepare('insert into pair_codes (code_hash, user_id, expires_at, device_id) values (?, ?, ?, ?)');
+                self::bindHash($ins, $hash, $uid, $expires);
+                $ins->bindValue(4, $deviceId, $deviceId === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+                $ins->execute();
+                return ['code' => $code, 'expires_at' => $expires, 'device' => $device];
             }
             throw new RuntimeException('kein freier Code gefunden');
         });
     }
 
     /**
-     * Löst einen Code ein und legt Gerät und Schlüssel an. Suchen und Verbrauchen laufen in einer
-     * Transaktion mit Schreibsperre, bei Parallelität gewinnt genau ein Aufruf. project_salt ist das Salz
-     * des Nutzers als Hex. Ein Fehlversuch zählt bei allen aktiven Codes mit und bleibt gespeichert.
+     * Löst einen Code ein. Suchen und Verbrauchen laufen in einer Transaktion mit Schreibsperre, bei Parallelität
+     * gewinnt genau ein Aufruf. Ein Fehlversuch zählt bei allen aktiven Codes mit und bleibt gespeichert.
      *
-     * @return array{device_id:int, key:string, project_salt:string, user_id:int}
+     * Welches Gerät: Gilt der Code für ein Gerät, ist es dieses (eine noch unbekannte Kennung wird ihm
+     * zugeordnet); sonst das Gerät des Nutzers mit dieser Kennung; sonst ein neues Gerät mit dieser Kennung.
+     * Ein bestehendes Gerät wird neu gekoppelt: alle bis dahin aktiven Schlüssel gesperrt (Grund 'repaired'; schon
+     * gesperrte behalten ihren Grund), eine Sperre
+     * des Geräts aufgehoben, Betriebssystem und Architektur aktualisiert, Daten unverändert. Den Namen ersetzt
+     * es nur bei $nameExplicit; sonst bleibt der bisherige, etwa auf der Webseite vergebene Name. Ein neues Gerät
+     * bekommt immer $name. Das Salz des Nutzers (users.source_salt) verlässt den Server nie.
+     *
+     * Signaturschlüssel: $signKey steht am neuen Eintrag in device_keys (auch wenn das Gerät ihn schon an einem älteren
+     * Eintrag hat); jeder Eintrag aus $previousSignKeys, den das Gerät noch nicht hat, kommt nach device_sign_keys.
+     * Ein Schlüssel gehört genau einem Gerät über alle Benutzer. Ein mit Besitznachweis gemeldeter Schlüssel steht in
+     * device_keys, ein früherer ohne Nachweis in device_sign_keys. Der aktuelle $signKey (der Handler hat seinen
+     * Nachweis geprüft) kommt immer an dieses Gerät: Hat ihn ein anderes Gerät, als früheren oder mit Nachweis, nimmt
+     * redeem ihn dort weg (der neueste gültige Nachweis gewinnt, Entscheidungen Z4 a und Z7 a). Einen früheren
+     * Schlüssel, den ein anderes Gerät schon hat, übernimmt redeem nicht, koppelt trotzdem und nennt ihn in
+     * sign_keys_refused. Hat das Gerät danach mehr als Limits::MAX_SIGN_KEYS_PER_DEVICE Schlüssel, fallen die ältesten
+     * früheren weg (Devices::capSignKeys); der aktuelle bleibt immer. Jeder angenommene Nachweis (Schlüssel und Code)
+     * gilt nur einmal, auch wenn newCode den Code später neu vergibt (pair_proofs, Entscheidung Z9 a).
+     *
+     * @param string $source Kennung des Rechners (device_source, geprüft mit Validator::deviceSource)
+     * @param bool $nameExplicit Name ausdrücklich gewählt (device_name_explicit, Plugin mit --name)
+     * @param string|null $signKey aktueller Signaturschlüssel (sign_public_key), 32 Byte roh
+     * @param list<string> $previousSignKeys frühere Signaturschlüssel (sign_public_keys_previous), je 32 Byte roh
+     * @param string|null $pluginVersion gemeldete Plugin-Version; null lässt devices.plugin_version unverändert
+     * @return array{device_id:int, key:string, user_id:int, repaired:bool, sign_keys_refused:list<string>} abgelehnte
+     *         Schlüssel roh, in der gesendeten Reihenfolge (aktueller zuerst), ohne Doppelte
      * @throws BadCodeException
+     * @throws SourceTaken Code für ein Gerät, Kennung gehört einem anderen Gerät desselben Nutzers (nichts geändert)
+     * @throws ProofReused derselbe Schlüssel wurde mit diesem Code schon einmal gekoppelt (nichts geändert)
      */
-    public function redeem(string $code, string $name, string $os, string $arch, int $now): array
-    {
-        $result = $this->db->tx(function (PDO $pdo) use ($code, $name, $os, $arch, $now): ?array {
+    public function redeem(
+        string $code,
+        string $name,
+        string $os,
+        string $arch,
+        string $source,
+        int $now,
+        bool $nameExplicit = false,
+        ?string $signKey = null,
+        array $previousSignKeys = [],
+        ?string $pluginVersion = null,
+    ): array {
+        $result = $this->db->tx(function (PDO $pdo) use ($code, $name, $os, $arch, $source, $now, $nameExplicit, $signKey, $previousSignKeys, $pluginVersion): ?array {
             // Codes gesperrter Konten (users.disabled_at) gelten nicht; sie zählen wie ein falscher Code.
             $find = $pdo->prepare(
-                'select c.id, c.user_id from pair_codes c join users u on u.id = c.user_id
+                'select c.id, c.user_id, c.device_id from pair_codes c join users u on u.id = c.user_id
                   where c.code_hash = ? and c.used_at is null and c.expires_at > ? and c.failed_attempts < ?
                     and u.disabled_at is null
                   order by c.id limit 1'
@@ -91,22 +145,152 @@ final class Pairing
                 )->execute([$now, self::MAX_FAILURES]);
                 return null;
             }
+            $uid = (int) $row['user_id'];
+            $saltSt = $pdo->prepare('select source_salt from users where id = ?');
+            $saltSt->execute([$uid]);
+            $salt = (string) $saltSt->fetchColumn();
+            $stored = self::storedSource($source, $salt);
+            $src = $pdo->prepare('select device_id from device_sources where user_id = ? and source = ?');
+            $src->execute([$uid, $stored]);
+            $known = $src->fetchColumn();
+            $known = $known === false ? null : (int) $known;
+
+            $deviceId = $row['device_id'] === null ? $known : (int) $row['device_id'];
+            if ($row['device_id'] !== null && $known !== null && $known !== $deviceId) {
+                // Die Ausnahme rollt die Transaktion zurück: Der Code bleibt gültig, nichts wird geändert.
+                throw new SourceTaken($uid);
+            }
+            if ($signKey !== null) {
+                // Ein Nachweis gilt nur einmal (Entscheidung Z9 a): Der Code allein reicht dafür nicht, weil newCode
+                // einen benutzten Code neu vergeben kann. Die Ausnahme rollt zurück, der Code bleibt gültig.
+                $fp = self::proofFingerprint($signKey, $code);
+                $seen = $pdo->prepare('select exists (select 1 from pair_proofs where fingerprint = ?)');
+                $seen->bindValue(1, $fp, PDO::PARAM_LOB);
+                $seen->execute();
+                if ((int) $seen->fetchColumn() === 1) {
+                    throw new ProofReused($uid);
+                }
+                $mark = $pdo->prepare('insert into pair_proofs (fingerprint, used_at) values (?, ?)');
+                $mark->bindValue(1, $fp, PDO::PARAM_LOB);
+                $mark->bindValue(2, $now, PDO::PARAM_INT);
+                $mark->execute();
+            }
             $pdo->prepare('update pair_codes set used_at = ? where id = ?')->execute([$now, $row['id']]);
-            $salt = $pdo->prepare('select project_salt from users where id = ?');
-            $salt->execute([$row['user_id']]);
-            $pdo->prepare('insert into devices (user_id, name, os, arch, created_at) values (?, ?, ?, ?, ?)')
-                ->execute([$row['user_id'], $name, $os, $arch, $now]);
-            $deviceId = (int) $pdo->lastInsertId();
+            $repaired = $deviceId !== null;
+            if ($repaired) {
+                // Nur bis dahin aktive Schlüssel bekommen den Grund 'repaired'; ein schon gesperrter behält Zeit und Grund.
+                $pdo->prepare(
+                    "update device_keys set revoked_at = ?, revoked_reason = 'repaired' where device_id = ? and revoked_at is null"
+                )->execute([$now, $deviceId]);
+                // coalesce(null, name) behält den bisherigen Namen.
+                $pdo->prepare('update devices set name = coalesce(?, name), os = ?, arch = ?, revoked_at = null where id = ? and user_id = ?')
+                    ->execute([$nameExplicit ? $name : null, $os, $arch, $deviceId, $uid]);
+            } else {
+                $pdo->prepare('insert into devices (user_id, name, os, arch, created_at) values (?, ?, ?, ?, ?)')
+                    ->execute([$uid, $name, $os, $arch, $now]);
+                $deviceId = (int) $pdo->lastInsertId();
+            }
+            if ($pluginVersion !== null) {
+                $pdo->prepare('update devices set plugin_version = ? where id = ?')->execute([$pluginVersion, $deviceId]);
+            }
+            if ($known === null) {
+                $pdo->prepare('insert into device_sources (user_id, source, device_id) values (?, ?, ?)')
+                    ->execute([$uid, $stored, $deviceId]);
+            }
             $key = self::KEY_PREFIX . rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
             // Als BLOB binden: die Datenannahme sucht den Hash als BLOB, und TEXT ist in SQLite nie gleich BLOB.
-            $st = $pdo->prepare('insert into device_keys (key_hash, device_id, created_at) values (?, ?, ?)');
+            $refused = [];
+            $current = null;
+            // Schlüssel, die das Gerät schon hat; sie kommen nicht doppelt nach device_sign_keys.
+            $own = array_fill_keys(Devices::signKeysIn($pdo, $deviceId), true);
+            if ($signKey !== null) {
+                $own[$signKey] = true;
+                // Der neueste gültige Nachweis gewinnt: Andere Geräte verlieren den Schlüssel, als früheren ohne
+                // Nachweis (Entscheidung Z4 a) und ebenso mit Nachweis (Entscheidung Z7 a). Wiedereinspielen scheitert
+                // an pair_proofs (oben), auch wenn derselbe Code neu vergeben wird.
+                $take = $pdo->prepare('delete from device_sign_keys where device_id <> ? and sign_public_key = ?');
+                $drop = $pdo->prepare('update device_keys set sign_public_key = null where device_id <> ? and sign_public_key = ?');
+                foreach ([$take, $drop] as $st) {
+                    $st->bindValue(1, $deviceId, PDO::PARAM_INT);
+                    $st->bindValue(2, $signKey, PDO::PARAM_LOB);
+                    $st->execute();
+                }
+                $current = $signKey;
+            }
+            $st = $pdo->prepare('insert into device_keys (key_hash, device_id, created_at, sign_public_key) values (?, ?, ?, ?)');
             $st->bindValue(1, Devices::hashKey($key), PDO::PARAM_LOB);
             $st->bindValue(2, $deviceId, PDO::PARAM_INT);
             $st->bindValue(3, $now, PDO::PARAM_INT);
+            $st->bindValue(4, $current, $current === null ? PDO::PARAM_NULL : PDO::PARAM_LOB);
             $st->execute();
-            return ['device_id' => $deviceId, 'key' => $key, 'project_salt' => bin2hex((string) $salt->fetchColumn()), 'user_id' => (int) $row['user_id']];
+            $add = $pdo->prepare('insert into device_sign_keys (sign_public_key, device_id, created_at) values (?, ?, ?)');
+            foreach ($previousSignKeys as $prev) {
+                if (in_array($prev, $refused, true)) {
+                    continue;
+                }
+                if (self::signKeyOwnedElsewhere($pdo, $prev, $deviceId)) {
+                    $refused[] = $prev;
+                    continue;
+                }
+                if (isset($own[$prev])) {
+                    continue;
+                }
+                $own[$prev] = true;
+                $add->bindValue(1, $prev, PDO::PARAM_LOB);
+                $add->bindValue(2, $deviceId, PDO::PARAM_INT);
+                $add->bindValue(3, $now, PDO::PARAM_INT);
+                $add->execute();
+            }
+            Devices::capSignKeys($pdo, $deviceId);
+            return [
+                'device_id' => $deviceId,
+                'key' => $key,
+                'user_id' => $uid,
+                'repaired' => $repaired,
+                'sign_keys_refused' => $refused,
+            ];
         });
         return $result ?? throw new BadCodeException();
+    }
+
+    /**
+     * Wert für device_sources.source: Hex-HMAC-SHA256 der Kennung des Rechners, Schlüssel ist das Salz des Benutzers
+     * (users.source_salt, roh). 64 Hex-Zeichen, klein.
+     */
+    public static function storedSource(string $source, string $salt): string
+    {
+        return hash_hmac('sha256', $source, $salt);
+    }
+
+    /** true, wenn ein anderes Gerät als $deviceId (gleich welchen Benutzers) den Signaturschlüssel schon hat. */
+    private static function signKeyOwnedElsewhere(PDO $pdo, string $signKey, int $deviceId): bool
+    {
+        $st = $pdo->prepare(
+            'select exists (select 1 from device_keys where device_id <> ? and sign_public_key = ?)'
+            . ' or exists (select 1 from device_sign_keys where device_id <> ? and sign_public_key = ?)'
+        );
+        self::bindKeyPair($st, $deviceId, $signKey)->execute();
+        return (int) $st->fetchColumn() === 1;
+    }
+
+    /** Bindet Gerät und Signaturschlüssel (BLOB) zweimal hintereinander: Plätze 1/2 und 3/4. */
+    private static function bindKeyPair(PDOStatement $st, int $deviceId, string $signKey): PDOStatement
+    {
+        foreach ([1, 3] as $i) {
+            $st->bindValue($i, $deviceId, PDO::PARAM_INT);
+            $st->bindValue($i + 1, $signKey, PDO::PARAM_LOB);
+        }
+        return $st;
+    }
+
+    /**
+     * Fingerabdruck eines Besitznachweises für pair_proofs: SHA-256 (roh) über Signaturschlüssel (32 Byte) und Code. Der
+     * Nachweis signiert Vorsatz, server_id und Code; die server_id ist je Server fest, Schlüssel und Code bestimmen ihn
+     * also. Ed25519 signiert deterministisch, und libsodium nimmt nur die kanonische Form an.
+     */
+    private static function proofFingerprint(string $signKey, string $code): string
+    {
+        return hash('sha256', $signKey . $code, true);
     }
 
     private static function hashCode(string $code): string

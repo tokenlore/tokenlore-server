@@ -14,7 +14,7 @@ use Tokenlore\Stats\Lists;
 use Tokenlore\Stats\ParamError;
 use Tokenlore\Stats\Stats;
 
-// Routen der Statistik (wie stats_handlers.go): GET /api/stats, /api/models, /api/accounts, /api/accounts/unknown.
+// Routen der Statistik (wie stats_handlers.go): GET /api/stats, /api/models, /api/accounts.
 // Alle mit Sitzung; die Gleichzeitigkeitsgrenze des Go-Servers (limitStats) entfällt laut Design.
 final class StatsHandlers
 {
@@ -30,7 +30,6 @@ final class StatsHandlers
         $router->add('GET', '/api/stats', $sess($h->stats(...)));
         $router->add('GET', '/api/models', $sess($h->models(...)));
         $router->add('GET', '/api/accounts', $sess($h->accounts(...)));
-        $router->add('GET', '/api/accounts/unknown', $sess($h->unknownSources(...)));
     }
 
     /** 400 mit Parametername, ohne Eingabewert. */
@@ -66,10 +65,5 @@ final class StatsHandlers
             return self::paramError($e);
         }
         return Response::json(200, (new Lists($this->db))->accounts((int) $r->attr('uid'), $f));
-    }
-
-    private function unknownSources(Request $r): Response
-    {
-        return Response::json(200, (new Lists($this->db))->unknownSources((int) $r->attr('uid')));
     }
 }

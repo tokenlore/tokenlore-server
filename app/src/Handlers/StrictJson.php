@@ -17,7 +17,7 @@ final class StrictJson
      * U+FFFD ersetzt. Fehler: 'syntax' (kein JSON oder überzähliger Inhalt), 'unknown' (unbekanntes Feld)
      * oder 'type' (falscher Typ; $field ist das Feld oder '' für den ganzen Rumpf); der erste Fehler zählt.
      *
-     * @param array<string,string> $spec Feld => 'string' | 'int' | 'bool'
+     * @param array<string,string> $spec Feld => 'string' | 'int' | 'bool' | 'string[]' (JSON-Liste nur aus Texten)
      * @return array{0: array<string,mixed>|null, 1: ?string, 2: string} Werte, Fehlerart, Feld
      */
     public static function decode(string $body, array $spec): array
@@ -53,6 +53,7 @@ final class StrictJson
                 'string' => is_string($value),
                 'int' => is_int($value),
                 'bool' => is_bool($value),
+                'string[]' => is_array($value) && array_is_list($value) && $value === array_filter($value, 'is_string'),
                 default => false,
             };
             if (!$ok) {

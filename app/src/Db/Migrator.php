@@ -31,7 +31,7 @@ use Tokenlore\Config\Paths;
 final class Migrator
 {
     // Höchste Nummer in app/migrations/; MigratorTest::testLatestMatchesMigrationFiles prüft das.
-    public const LATEST = 1;
+    public const LATEST = 2;
 
     private const KEEP_BACKUPS = 5;
     private const LOCK_FILE = 'migrate.lock';
@@ -57,6 +57,20 @@ final class Migrator
             return 0;
         }
         return (int) $pdo->query('select max(version) from schema_version')->fetchColumn();
+    }
+
+    /**
+     * true bei einer Datenbank vom Stand vor dem Plugin-Archiv: Stand 1, aber ohne die Tabelle device_sign_keys. Dieser
+     * Stand hatte dieselbe Nummer, weil 0001 direkt geändert wurde; eine Umstellung gibt es nicht, der Betreiber richtet
+     * neu ein (OldDatabaseHandlers).
+     */
+    public function isPreArchive(): bool
+    {
+        if ($this->currentVersion() < 1) {
+            return false;
+        }
+        $st = $this->db->pdo()->query("select 1 from sqlite_master where type = 'table' and name = 'device_sign_keys'");
+        return $st->fetchColumn() === false;
     }
 
     public function migrate(): void

@@ -25,7 +25,7 @@ Dein Webspace braucht:
 | Was | Wert |
 |---|---|
 | PHP | Version **8.2 oder neuer** |
-| PHP-Erweiterungen | `pdo_sqlite`, `json`, `openssl`, `mbstring`, `ctype` und **Argon2id** für die Passwörter (bei den meisten Hostern kommt das mit der Erweiterung `sodium`) |
+| PHP-Erweiterungen | `pdo_sqlite`, `json`, `openssl`, `mbstring`, `ctype`, **`sodium`** für die Signaturen der Plugins und **Argon2id** für die Passwörter (bei den meisten Hostern kommt Argon2id mit `sodium`). Fehlt `sodium`: im Hoster-Menü unter „PHP-Einstellungen“ die Erweiterung `sodium` anschalten. |
 | SQLite | Version **3.27 oder neuer** mit den JSON-Funktionen (JSON1). Beides gehört zu PHP; bei PHP 8.2 ist es fast immer dabei. |
 | Adresse | **HTTPS** (ein gültiges Zertifikat, bei den meisten Hostern Let's Encrypt). Ohne HTTPS gibt es keine Anmeldung. |
 | Schreibrechte | PHP muss im Ordner `data/` Dateien anlegen dürfen |
@@ -81,7 +81,7 @@ gewählten Ordner und lösche den leeren Ordner.
 **Schritt 4: Einrichtungsseite öffnen.** Rufe die Adresse im Browser auf, z. B. `https://example.de/tokenlore/`.
 Du siehst die Seite „tokenlore einrichten“ in vier Teilen:
 
-1. **Prüfung des Servers:** PHP-Version, Erweiterungen, SQLite, Argon2id, Datenordner, Grenzwerte und HTTPS. Alles sollte
+1. **Prüfung des Servers:** PHP-Version, Erweiterungen (darunter `sodium`), SQLite, Argon2id, Datenordner, Grenzwerte und HTTPS. Alles sollte
    „In Ordnung“ sein. Bei „Warnung“ oder „Fehler“ steht dabei, was zu tun ist.
 2. **Datenbank und Adressen:**
    - **Datenordner:** Die Seite prüft mit einer Testdatei selbst, ob der Datenordner von außen abrufbar ist. Kommt die
@@ -233,7 +233,7 @@ Wer die Adresse kennt, sieht die Anmeldeseite von tokenlore. Willst du, dass Fre
 Passwortschutz deines Webservers (Basic-Auth): Der Browser fragt dann zuerst nach einem zweiten Benutzernamen und
 Passwort. Die Webseite funktioniert dahinter ganz normal.
 
-**Drei Adressen müssen frei bleiben:** `…/api/plugin/pair`, `…/api/plugin/ingest` und `…/api/plugin/ca`. Über sie
+**Vier Adressen müssen frei bleiben:** `…/api/plugin/pair`, `…/api/plugin/ingest`, `…/api/plugin/ca` und `…/api/plugin/info`. Über sie
 liefern die Plugins. Sie schicken ihren Geräteschlüssel im selben Header, den der Passwortschutz braucht, und können
 kein zweites Passwort mitsenden. Die eingebaute Funktion „Passwortgeschützte Verzeichnisse“ von Plesk kann solche
 Ausnahmen nicht. Nimm deshalb eine der Regeln unten. Sie lassen außerdem `/.well-known/acme-challenge/` frei, damit
@@ -264,7 +264,7 @@ von tokenlore: Die ersetzt jedes Update. Je nach Ort der Installation:
   **darüber** (`httpdocs/.htaccess`, an den Anfang, falls es die Datei schon gibt):
 
   ```apache
-  SetEnvIf Request_URI "^/tokenlore/(index\.php/)?api/plugin/(pair|ingest|ca)$" TL_FREI=1
+  SetEnvIf Request_URI "^/tokenlore/(index\.php/)?api/plugin/(pair|ingest|ca|info)$" TL_FREI=1
   SetEnvIf Request_URI "^/\.well-known/acme-challenge/" TL_FREI=1
   AuthType Basic
   AuthName "tokenlore"
@@ -283,7 +283,7 @@ von tokenlore: Die ersetzt jedes Update. Je nach Ort der Installation:
 
   ```apache
   <Directory "/var/www/vhosts/example.de/httpdocs">
-      SetEnvIf Request_URI "^/(index\.php/)?api/plugin/(pair|ingest|ca)$" TL_FREI=1
+      SetEnvIf Request_URI "^/(index\.php/)?api/plugin/(pair|ingest|ca|info)$" TL_FREI=1
       SetEnvIf Request_URI "^/\.well-known/acme-challenge/" TL_FREI=1
       AuthType Basic
       AuthName "tokenlore"
@@ -312,7 +312,7 @@ Block mit `map` steht außerhalb von `server { … }`.
 
 ```nginx
 map $request_uri $tl_auth {
-    "~^/tokenlore/(index\.php/)?api/plugin/(pair|ingest|ca)(\?.*)?$" off;
+    "~^/tokenlore/(index\.php/)?api/plugin/(pair|ingest|ca|info)(\?.*)?$" off;
     default "tokenlore";
 }
 
@@ -364,11 +364,17 @@ keine regelmäßige Kopie: Lade ab und zu **alle Dateien `tokenlore-*.sqlite*`**
 ## 4. Geräte koppeln
 
 Ein „Gerät“ ist ein Rechner, auf dem Claude Code läuft. Dort schickt das tokenlore-**Plugin** nur Zahlen und
-Metadaten an deinen Server, nie Inhalte. Was genau gesendet wird, zeigt die Seite „Datenschutz“.
+Metadaten an deinen Server, nie Inhalte. Was genau gesendet wird, zeigt die Seite „Datenschutz“. Jede Anfrage legt
+das Plugin zuerst unterschrieben in einem Archiv auf dem Rechner ab und liefert dann daraus, beim Start und nach dem
+Ende jeder Claude-Code-Sitzung. Nach dem Ende einer Sitzung höchstens alle 5 Minuten: Kam der letzte Abgleich vor
+weniger als 5 Minuten, kommt die letzte Anfrage der Sitzung mit dem ersten Abgleich, der mindestens 5 Minuten nach
+dieser Anfrage läuft; dabei geht nichts verloren, und nichts zählt doppelt. Ist dein Server mal nicht erreichbar, geht
+ebenfalls nichts verloren; dein Server nimmt nur Zeilen mit gültiger Unterschrift des Geräts an.
 
 **Halte das Plugin auf dem neuesten Stand.** Es prüft das Zertifikat deines Servers wie ein Browser und versteht
-Adressen mit Pfad. Ein veraltetes Plugin koppelt mit diesem Server nicht; aktualisiere es dann wie in Schritt 1. Daten anderer tokenlore-Server übernimmt dieser Server nicht; jedes Gerät koppelst
-du hier neu.
+Adressen mit Pfad. Ein veraltetes Plugin koppelt und liefert nicht; aktualisiere es dann wie in Schritt 1. Hast du
+schon einen anderen tokenlore-Server, koppelst du jedes Gerät hier zusätzlich; die älteren Zahlen schickt das Plugin
+dabei auch an diesen Server ([siehe unten](#ein-rechner-bleibt-ein-gerät)).
 
 **Schritt 1: Plugin installieren oder aktualisieren.** Auf dem Gerät in einer `claude`-Sitzung im Terminal:
 
@@ -407,6 +413,48 @@ Umschreibregeln fehlen, enthält sie `/index.php`. Auch das ist richtig.
 **Zum Testen:** Das Plugin verbindet nur über HTTPS. Auf `http://localhost` lässt sich deshalb der Server selbst
 ausprobieren, aber nicht mit dem echten Plugin koppeln. Teste die Kopplung auf deinem echten Webspace: Nach dem
 Koppeln sollten auf der Seite „Geräte“ dein Gerät und nach kurzer Zeit die ersten Zahlen erscheinen.
+
+### Ein Rechner bleibt ein Gerät
+
+Ein Rechner bleibt auf deinem Server immer **ein** Gerät, egal ob du es sperrst, neu koppelst oder das Plugin neu
+installierst. Das Plugin legt dafür beim ersten Koppeln eine kleine Datei `tokenlore-id` in den Claude-Ordner des
+Rechners (meist `~/.claude`) und löscht sie nie. Daran erkennt der Server den Rechner wieder. Ein zweiter Rechner hat
+seine eigene Datei und wird ein eigenes Gerät; seine Zahlen kommen zu denen des ersten hinzu.
+
+**Neu koppeln.** Koppelst du einen Rechner, den der Server schon kennt, mit einem neuen Code, landet er beim selben
+Gerät. Seine Zahlen bleiben, der alte Schlüssel wird gesperrt, und eine Sperre des Geräts ist aufgehoben. Claude Code
+meldet dann „Bestehendes Gerät neu gekoppelt“. So holst du auch ein gesperrtes Gerät zurück. Der Name des Geräts
+bleibt dabei, etwa einer, den du auf der Seite „Geräte“ vergeben hast. Nur mit `--name` bekommt es den neuen Namen.
+
+**Code für ein bestimmtes Gerät.** Erkennt der Server den Rechner nicht wieder (etwa weil die Datei `tokenlore-id`
+gelöscht wurde), öffne auf der Seite „Geräte“ das Gerät und dort unter „Neu koppeln“ den Knopf „Code für dieses
+Gerät“. Die Kopplungsseite zeigt dann, für welches Gerät der Code gilt. Mit diesem Code koppelt genau dieses Gerät neu,
+statt dass ein neues entsteht. Gehört der Rechner schon zu einem anderen deiner Geräte, lehnt der Server den Code ab,
+und es ändert sich nichts.
+
+**Ältere Zahlen (Altbestand).** Claude Code führt auf jedem Rechner eine Tagesübersicht, auch aus der Zeit vor
+tokenlore. Das Plugin übernimmt sie einmal in sein Archiv und schickt sie nach jedem Koppeln an den Server, auf jedem
+Server, mit dem du koppelst. Der Server behält für jeden Tag die zuerst angekommene Angabe und ändert sie nie. Deshalb
+kommt der Altbestand überall an und zählt nie doppelt, auch wenn du dasselbe Gerät mehrmals koppelst. Einen Tag, den
+ein anderes Gerät schon mit genau denselben Werten hat, zählt nur dieses.
+
+**Zusammenlegen.** Zeigen zwei deiner Geräte dieselben abgeschlossenen Tage, ist es wahrscheinlich derselbe Rechner
+(etwa nachdem die Datei `tokenlore-id` verloren ging). Die Seite „Geräte“ zeigt dann „… hat dieselben Tage wie …
+Zusammenlegen?“. Erst wenn du auf „Zusammenlegen …“ klickst und bestätigst, wird aus beiden ein Gerät: Zahlen,
+Schlüssel und Kennungen gehen auf das verbleibende Gerät über, nichts zählt doppelt, und das Plugin sendet ohne neue
+Kopplung weiter. Das lässt sich nicht rückgängig machen. Ohne deine Bestätigung legt der Server nie Geräte zusammen.
+
+**Claude-Ordner kopiert.** Hast du den Ordner `~/.claude` von einem anderen Rechner kopiert, liefert das Plugin dort
+nichts, bis du neu koppelst. Beim Koppeln wird der Rechner ohne Rückfrage ein eigenes Gerät; Anfragen, die schon der
+ursprüngliche Rechner geliefert hat, zählen nicht doppelt. Ziehst du ganz auf einen neuen Rechner um, sperre das alte
+Gerät auf der Seite „Geräte“.
+
+**Hinweis „lag schon bei einem anderen Benutzer oder Gerät“.** Jede Anfrage und jede Sitzung zählt auf dem Server nur
+einmal, bei dem Benutzer, der sie zuerst geliefert hat. Liefert ein anderer Benutzer dieselbe Anfrage oder arbeitet er
+in derselben Sitzung weiter, zählt das nur beim ersten. Ebenso zählt ein Tag aus dem Altbestand, den ein anderes Gerät
+schon mit genau denselben Werten hat, nur dort, etwa bei einem kopierten Claude-Ordner. Die Seite „Geräte“ zeigt dann
+beim Gerät, wie viele Anfragen und Tage das betrifft. Das ist kein Fehler: Die Kopplung gilt, und alles andere zählt
+normal.
 
 ---
 
@@ -448,6 +496,11 @@ Version ändert, steht in `CHANGELOG.md`.
 Datenordner eine Kopie an: `backup-<alter Stand>-<Zeitpunkt>-<Zufallszeichen>.sqlite`. Die fünf neuesten bleiben
 liegen, ältere werden gelöscht. Geht bei der Umstellung etwas schief, bleibt die Datenbank unverändert.
 
+**Manche Datenbanken lassen sich nicht umstellen.** Stammt deine Datenbank von einer Version, die die Zahlen
+anders gespeichert hat, ändert der Server an ihr nichts. Die Webseite zeigt dann „Die Datenbank stammt von einer
+älteren Version“ mit den Schritten: Datenordner sichern, die Datenbank löschen, tokenlore neu einrichten und die
+Rechner neu koppeln. Die Plugins schicken danach alles aus ihrem Archiv erneut, auch die älteren Zahlen.
+
 Die laufende Version steht in der Datei `VERSION` im Installationsordner.
 
 **Eine Sicherung zurückspielen:** Lade die aktuelle Datenbank (`tokenlore-*.sqlite` samt `-wal` und `-shm`) aus dem
@@ -472,7 +525,8 @@ des Teams. Für dich allein reicht das erste Konto, das du bei der Einrichtung a
 Summe über das Team. Unter „Mitglieder“ legst du neue Konten an (Benutzername und Passwort geben Admins dem neuen
 Mitglied auf einem sicheren Weg weiter; ändern kann es das Passwort selbst unter „Einstellungen“) und verwaltest
 bestehende: Admin-Rechte vergeben oder entziehen, neues Passwort setzen, alle Sitzungen beenden, sperren und entsperren.
-„Server“ enthält die Server-Einstellungen.
+„Server“ enthält die Server-Einstellungen und zeigt oben, ob die PHP-Erweiterung `sodium` angeschaltet ist; fehlt sie,
+steht dort, wo du sie anschaltest.
 
 **Hinweis an Mitglieder.** Sag jedem Mitglied **vorher**, dass Admins seine Nutzungsdaten einsehen können. Gesehen wird
 nur, was das Plugin ohnehin sendet: Zahlen und Metadaten wie Zeiten, Modelle, Werkzeugnamen und Geräte, nie Inhalte (je
@@ -525,17 +579,27 @@ hier offen gesagt:
 - **Apache-Fehlerseiten haben keine Sicherheits-Header.** Seiten, die Apache selbst erzeugt (etwa die 403-Seite für
   gesperrte Ordner), tragen nicht die Sicherheits-Header, die der Server sonst setzt. Sie enthalten keine Daten.
 - **Wer den Server betreibt, sieht alle Zahlen** (keine Inhalte, aber Zeiten, Modelle, Werkzeugnamen und je nach
-  E-Mail-Stufe die Adresse). Das gilt auch für Admins ([Abschnitt 6](#6-team)).
+  E-Mail-Stufe die Adresse). Das gilt auch für Admins ([Abschnitt 6](#6-team)). Auf gemietetem Webspace kann außerdem
+  dein Hoster die Datenbankdatei im Datenordner und die Logs lesen.
+- **Der Hinweis beim Gerät verrät etwas.** Zeigt ein Gerät, dass Anfragen oder Tage schon anderswo lagen, weiß sein
+  Benutzer: Genau diese Anfrage oder genau diese Tageswerte liegen schon bei jemandem auf diesem Server. Wer, sieht er
+  nicht.
 - **Kein Betrieb für große Teams.** Gedacht ist der Server für wenige Personen und Geräte. Es gibt keine
   Echtheitsprüfung der Nutzungsdaten und keine Rangliste.
 - **Kein automatisches Update und keine Übernahme alter Daten** aus dem früheren Go-Server ([Abschnitt 5](#5-updates)).
+- **Neu eingerichteter Server heißt neue Geräte.** Das Plugin erkennt einen Rechner an der Kennung des Servers, die
+  bei der Einrichtung entsteht und in der Datenbank steht. Ziehst du mit deinem Datenordner auf eine andere Adresse um,
+  bleibt jeder Rechner nach dem Neukoppeln sein bisheriges Gerät. Richtest du den Server neu ein, erscheint jeder
+  Rechner als neues Gerät.
 
 ---
 
 ## 9. Fehlersuche
 
 **Die Einrichtungsseite meldet einen Fehler bei den Voraussetzungen.** Stelle im Panel deines Hosters PHP 8.2 oder neuer
-ein und aktiviere die genannte Erweiterung (`pdo_sqlite`, `json`, `openssl`, `mbstring`, `ctype`). Fehlt Argon2id, ist
+ein und aktiviere die genannte Erweiterung (`pdo_sqlite`, `json`, `openssl`, `mbstring`, `ctype`, `sodium`). Für `sodium`
+heißt das: im Hoster-Menü unter „PHP-Einstellungen“ die Erweiterung `sodium` anschalten (in Plesk im Bereich
+„Erweiterungen“). Fehlt Argon2id, ist
 SQLite älter als 3.27 oder fehlen ihm die JSON-Funktionen, wähle eine andere PHP-Version oder frag deinen Hoster. Ist der Datenordner nicht beschreibbar, setze im FTP-Programm die Rechte für
 `data/` auf 755 oder 775 (je nach Hoster; im Zweifel in dessen Hilfe nachsehen).
 
@@ -592,5 +656,50 @@ dem Ordner heraus.
 tokenlore-Version“.** Du hast eine ältere Version über eine neuere Installation gelegt. Spiel die neueste Version ein;
 die Daten sind unversehrt.
 
-**Es kommen keine Zahlen von einem Gerät an.** Prüfe auf dem Gerät mit `/tokenlore:status`, ob es gekoppelt ist und ob
-das Plugin die Version 0.2.0 oder neuer hat. Mit `/tokenlore:sync` stößt du den Abgleich sofort an.
+**Die Webseite zeigt „Die Datenbank stammt von einer älteren Version“, und Claude Code meldet beim Koppeln oder
+Liefern „Die Datenbank des Servers stammt von einer älteren Version“.** Folge den Schritten auf der Webseite: Lade den
+Datenordner per FTP auf deinen Rechner, lösche auf dem Server die Datei `tokenlore-….sqlite` (samt `-wal` und `-shm`,
+falls vorhanden), lade die Seite neu und richte tokenlore neu ein. Koppel danach jeden Rechner neu; das Plugin schickt
+dann alles aus seinem Archiv erneut.
+
+**Es kommen keine Zahlen von einem Gerät an.** Prüfe auf dem Gerät mit `/tokenlore:status`, ob es gekoppelt ist. Mit
+`/tokenlore:sync` stößt du den Abgleich sofort an. Zeigt die Seite „Geräte“ beim Gerät „Plugin veraltet“, nimmt dein
+Server von dieser Plugin-Version nichts an; Claude Code meldet dann „Bitte tokenlore auf mindestens … aktualisieren“.
+Aktualisiere das Plugin wie in [Abschnitt 4](#4-geräte-koppeln), Schritt 1. Die Zahlen warten so lange im Archiv des
+Rechners und kommen danach an.
+
+**Claude Code meldet „Signaturschlüssel fehlt, bitte neu koppeln“.** Das Plugin unterschreibt jede Zeile mit einem
+Schlüssel, der auf dem Rechner liegt. Fehlt er, liefert es nichts. Koppele das Gerät neu; es bleibt dasselbe Gerät, und
+ältere Zeilen prüft der Server weiter mit dem Schlüssel, mit dem sie unterschrieben sind.
+
+**Claude Code meldet „Der Server kennt den Signaturschlüssel dieses Geräts nicht mehr“.** Ein anderes Gerät hat beim <!-- doku-ok: Wortlaut der Meldung -->
+Koppeln denselben Signaturschlüssel gemeldet und ihn damit übernommen, meist weil der Datenordner des Plugins samt
+Schlüssel auf einen anderen Rechner kopiert wurde. Bis zum Neukoppeln liefert dieses Gerät nichts; nichts geht verloren.
+Koppele es neu, dann holt es den Schlüssel zurück.
+
+**Claude Code meldet „… ältere Archivzeilen gehen nicht an den Server …“.** Ein anderes Gerät hat einen früheren <!-- doku-ok: Fachbegriff früherer Signaturschlüssel -->
+Signaturschlüssel dieses Rechners übernommen, und auf dem Rechner selbst fehlt dieser Schlüssel. Neue Zahlen
+liefert das Gerät weiter. Die älteren Zeilen mit diesem Schlüssel hält das Plugin zurück; was davon nie geliefert
+wurde, fehlt auf deinem Server. Ist das andere Gerät derselbe Rechner, lege beide auf der Seite „Geräte“ zusammen
+([Abschnitt 4](#ein-rechner-bleibt-ein-gerät)) und koppele das Gerät danach neu. Dann schickt das Plugin die älteren
+Zeilen mit, und nichts zählt doppelt. Nur neu koppeln, ohne zusammenzulegen, reicht dafür nicht.
+
+**Claude Code meldet „Dieses Gerät wurde anderswo neu gekoppelt“.** Dasselbe Gerät wurde auf einem anderen Rechner
+oder mit einem neueren Code gekoppelt, der Schlüssel auf diesem Rechner ist deshalb gesperrt. Soll dieser Rechner weiter
+liefern, hol auf der Webseite einen Code und koppele ihn neu.
+
+**Claude Code meldet „Dieses Gerät ist auf dem Server gesperrt“.** Du hast das Gerät auf der Webseite gesperrt. Soll es
+wieder liefern, koppele es mit einem neuen Code neu; es bleibt dasselbe Gerät mit seinen Zahlen.
+
+**Claude Code meldet „Dieser Ordner stammt von einem anderen Rechner oder einer anderen Kopplung“.** Die Datei
+`tokenlore-id` im Claude-Ordner passt nicht zur Kopplung, etwa weil sie ersetzt oder der Ordner kopiert wurde. Bis zum
+Neukoppeln geht nichts an den Server; nichts geht verloren. Koppele das Gerät neu; mit einem „Code für dieses Gerät“
+landet es sicher beim richtigen Gerät.
+
+**`/tokenlore:connect` meldet „Kopplung abgelehnt: Dieser Rechner ist auf dem Server schon ein anderes Gerät“.** Du hast einen „Code für dieses Gerät“
+benutzt, aber der Rechner gehört schon zu einem anderen deiner Geräte. Es hat sich nichts geändert. Hol einen normalen
+Code unter „Gerät hinzufügen“, dann landet der Rechner bei seinem eigenen Gerät; sind beide Geräte derselbe Rechner,
+lege sie auf der Seite „Geräte“ zusammen.
+
+**Ein Rechner steht zweimal in der Geräteliste.** Wahrscheinlich ging die Datei `tokenlore-id` verloren. Sobald beide Geräte drei gleiche abgeschlossene Tage haben, schlägt die Seite
+„Geräte“ „Zusammenlegen?“ vor ([Abschnitt 4](#ein-rechner-bleibt-ein-gerät)).

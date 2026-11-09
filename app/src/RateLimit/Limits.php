@@ -31,6 +31,10 @@ final class Limits
     public const CA_PER_IP = 0.5;
     public const CA_BURST = 10;
 
+    // Abruf der Server-Kennung vor dem Koppeln (ohne Anmeldung): wie der CA-Abruf, eigener Topf.
+    public const INFO_PER_IP = 0.5;
+    public const INFO_BURST = 10;
+
     // Alle Sitzungsrouten je IP, vor der Sitzungsprüfung.
     public const SESSION_PER_IP = 20.0;
     public const SESSION_BURST = 60;
@@ -44,6 +48,7 @@ final class Limits
         'pair' => [self::PAIR_PER_IP, self::PAIR_BURST],
         'recovery' => [self::RECOVERY_PER_IP, self::RECOVERY_BURST],
         'ca' => [self::CA_PER_IP, self::CA_BURST],
+        'info' => [self::INFO_PER_IP, self::INFO_BURST],
         'session' => [self::SESSION_PER_IP, self::SESSION_BURST],
         'ingest_ip' => [self::INGEST_PER_IP, self::INGEST_PER_IP_BURST],
     ];

@@ -65,7 +65,7 @@ final class Middleware
 
     /**
      * Begrenzt je Client-IP (IPv6 je /64, zusätzlich gesammelt je /48); läuft vor jeder teuren Arbeit.
-     * $bucket: ein Name aus Limits::PER_IP (login, pair, recovery, ca, session, ingest_ip). Bei Ablehnung 429
+     * $bucket: ein Name aus Limits::PER_IP (login, pair, recovery, ca, info, session, ingest_ip). Bei Ablehnung 429
      * mit Retry-After.
      */
     public function limitIp(string $bucket): Closure

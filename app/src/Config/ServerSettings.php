@@ -8,7 +8,8 @@ use PDO;
 use Tokenlore\Db\Database;
 
 // Serverweite Einstellungen aus der Tabelle server_settings (nur Admins ändern sie):
-// public_url (öffentliche Adresse), trust_proxy ('0' | '1') und ca_pem (eigenes CA-Zertifikat für --ca).
+// public_url (öffentliche Adresse), trust_proxy ('0' | '1') und ca_pem (eigenes CA-Zertifikat für --ca); dazu die
+// unveränderliche server_id (nur lesbar).
 // Eine Instanz liest die Tabelle einmal beim Laden und führt sich bei save() nach.
 final class ServerSettings
 {
@@ -36,6 +37,19 @@ final class ServerSettings
     {
         $v = $this->values['public_url'] ?? '';
         return $v === '' ? null : $v;
+    }
+
+    /**
+     * Kennung dieses Servers (64 Hex-Zeichen, klein). Sie entsteht beim Anlegen der Datenbank und ist unveränderlich:
+     * save() kennt den Schlüssel nicht, Trigger der Datenbank verbieten Ändern und Löschen.
+     */
+    public function serverId(): string
+    {
+        $id = $this->values['server_id'] ?? '';
+        if (preg_match('/^[0-9a-f]{64}\z/', $id) !== 1) {
+            throw new \RuntimeException('server_id fehlt oder ist ungültig');
+        }
+        return $id;
     }
 
     public function trustProxy(): bool

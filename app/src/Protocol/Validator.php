@@ -6,6 +6,7 @@ namespace Tokenlore\Protocol;
 
 // Prüft Plugin-Daten wie https://github.com/tokenlore/tokenlore/blob/main/protocol/validate.go: gleiche Regeln, Grenzen und Fehlertexte.
 // Eingaben sind dekodierte JSON-Arrays (json_decode(..., true)). Rückgabe: null = gültig, sonst der Fehlertext.
+// Ausnahme: die signierten Inhaltszeilen (requestLine, dayLine) kommen als stdClass und liefern [Pfad, Meldung].
 //
 // Go erzwingt Typen schon beim Dekodieren in seine Strukturen; PHP tut das nicht. Diese Prüfung steht deshalb
 // vor den Wertregeln und meldet "<feld>: falscher Typ oder Zahl außerhalb des Bereichs", den Text des Go-Dekodierers
@@ -20,97 +21,312 @@ final class Validator
     /** @var list<string>|null */
     private static ?array $zones = null;
 
-    /** @param array<mixed> $r Anfrage; $nowMs ist die Uhr des Prüfenden in Millisekunden seit 1970 (UTC). */
-    public static function request(array $r, int $nowMs): ?string
+    // Inhaltszeilen (Abschnitt „Inhaltszeile“ in protocol/doc.md). Sie stammen aus dem Archiv des Plugins und sind
+    // signiert; der Server liest sie aus genau dem gelieferten Text z (json_decode zu stdClass, damit {} und [] sich
+    // unterscheiden). Die Prüfungen geben null oder [Pfad unter z, Meldung] zurück; Pfade enthalten nur feste
+    // Feldnamen, nie Schlüssel oder Werte aus der Zeile.
+
+    /** Felder einer Anfrage: Typ und ob Pflicht. */
+    private const REQUEST_LINE = [
+        'kind' => ['string', true], 'request_id' => ['string', true], 'message_id' => ['string', true],
+        'session_id' => ['string', true], 'uuid' => ['string', false], 'parent_uuid' => ['string', false],
+        'ts' => ['string', true], 'utc_offset_min' => ['int', true], 'model' => ['string', true],
+        'requested_model' => ['string', false], 'effort' => ['string', false], 'entrypoint' => ['string', false],
+        'cc_version' => ['string', false], 'stop_reason' => ['string', false], 'subagent' => ['bool', true],
+        'tools' => ['object', false], 'account_id' => ['string', false], 'usage' => ['object', true],
+    ];
+
+    /** Felder eines Vorgeschichte-Tags. */
+    private const DAY_LINE = [
+        'kind' => ['string', true], 'date' => ['string', true], 'models' => ['object', false],
+        'activity' => ['object', false], 'complete_before' => ['string', false],
+    ];
+
+    /**
+     * Zählwerte einer Anfrage und ihr Pfad in usage (Tabelle „Zählwerte“); fehlt ein Wert, gilt 0.
+     * Die Grenze ist MAX_TOKENS_PER_FIELD, für web_search und web_fetch MAX_COUNT_PER_FIELD.
+     */
+    public const USAGE_COUNTS = [
+        'input' => ['input_tokens'],
+        'output' => ['output_tokens'],
+        'cache_create' => ['cache_creation_input_tokens'],
+        'cache_read' => ['cache_read_input_tokens'],
+        'cache_1h' => ['cache_creation', 'ephemeral_1h_input_tokens'],
+        'cache_5m' => ['cache_creation', 'ephemeral_5m_input_tokens'],
+        'thinking' => ['output_tokens_details', 'thinking_tokens'],
+        'web_search' => ['server_tool_use', 'web_search_requests'],
+        'web_fetch' => ['server_tool_use', 'web_fetch_requests'],
+    ];
+
+    /**
+     * Prüft die Inhaltszeile einer Anfrage und liest ihre Werte.
+     *
+     * $out bei Erfolg: message_id, request_id, session_id, ts (Text), ts_ms (Millisekunden seit 1970, UTC),
+     * utc_offset_min, model, die Zählwerte aus USAGE_COUNTS, stop_reason und account_id ('' wenn nicht da), subagent,
+     * tools (Name => Anzahl) und extra (übrige Schlüssel der obersten Ebene von usage mit Zahl oder Text, alphabetisch,
+     * höchstens MAX_EXTRA_FIELDS).
+     *
+     * @param mixed $o dekodierte Zeile; $nowMs ist die Uhr des Servers in Millisekunden
+     * @param array<string, mixed>|null $out
+     * @return array{0: string, 1: string}|null
+     */
+    public static function requestLine(mixed $o, int $nowMs, ?array &$out = null): ?array
     {
-        $err = self::types($r, [
-            'request_id' => 'string', 'message_id' => 'string', 'session_id' => 'string',
-            'utc_offset_min' => 'int', 'model' => 'string',
-            'input' => 'int', 'output' => 'int', 'cache_create' => 'int', 'cache_read' => 'int',
-            'cache_1h' => 'int', 'cache_5m' => 'int', 'thinking' => 'int',
-            'web_search' => 'int', 'web_fetch' => 'int',
-            'stop_reason' => 'string', 'subagent' => 'bool', 'tools' => 'intmap',
-            'account_id' => 'string', 'extra' => 'object',
-        ]);
+        $out = null;
+        $err = self::lineShape($o, 'request', self::REQUEST_LINE);
         if ($err !== null) {
             return $err;
         }
-        $ts = self::parseTimestamp($r['ts'] ?? null);
+        $v = get_object_vars($o);
+        foreach (['message_id', 'session_id'] as $f) {
+            if (!self::matches(Limits::ID_PATTERN, $v[$f])) {
+                return [$f, 'ungültig'];
+            }
+        }
+        if ($v['request_id'] !== '' && !self::matches(Limits::ID_PATTERN, $v['request_id'])) {
+            return ['request_id', 'ungültig'];
+        }
+        foreach (['uuid', 'parent_uuid', 'account_id'] as $f) {
+            if (isset($v[$f]) && !self::matches(Limits::ID_PATTERN, $v[$f])) {
+                return [$f, 'ungültig'];
+            }
+        }
+        $ts = self::matches(Limits::TS_PATTERN, $v['ts']) ? self::parseTimestamp($v['ts']) : null;
         if ($ts === null) {
-            return 'ts ungültig';
-        }
-
-        if (!self::matches(Limits::ID_PATTERN, $r['message_id'] ?? '')) {
-            return 'message_id ungültig';
-        }
-        $requestId = $r['request_id'] ?? '';
-        if ($requestId !== '' && !self::matches(Limits::ID_PATTERN, $requestId)) {
-            return 'request_id ungültig';
-        }
-        if (!self::matches(Limits::ID_PATTERN, $r['session_id'] ?? '')) {
-            return 'session_id ungültig';
-        }
-        $accountId = $r['account_id'] ?? '';
-        if ($accountId !== '' && !self::matches(Limits::ID_PATTERN, $accountId)) {
-            return 'account_id ungültig';
-        }
-        if (!self::matches(Limits::MODEL_PATTERN, $r['model'] ?? '')) {
-            return 'model ungültig';
+            return ['ts', 'ungültig'];
         }
         if ($ts[0] < Limits::EARLIEST_UNIX) {
-            return 'ts vor 2024';
+            return ['ts', 'vor 2024'];
         }
         if (self::isAfter($ts, $nowMs + Limits::MAX_FUTURE_SKEW_MS)) {
-            return 'ts liegt in der Zukunft';
+            return ['ts', 'liegt in der Zukunft'];
         }
-        $offset = $r['utc_offset_min'] ?? 0;
-        if ($offset < -14 * 60 || $offset > 14 * 60) {
-            return 'utc_offset_min außerhalb ±14 h';
+        if ($v['utc_offset_min'] < -Limits::MAX_UTC_OFFSET_MIN || $v['utc_offset_min'] > Limits::MAX_UTC_OFFSET_MIN) {
+            return ['utc_offset_min', 'außerhalb ±14 h'];
         }
-        foreach (['input', 'output', 'cache_create', 'cache_read', 'cache_1h', 'cache_5m', 'thinking'] as $f) {
-            $v = $r[$f] ?? 0;
-            if ($v < 0 || $v > Limits::MAX_TOKENS_PER_FIELD) {
-                return 'Token-Wert außerhalb des Bereichs';
+        foreach (['model', 'requested_model'] as $f) {
+            if (($f === 'model' || isset($v[$f])) && !self::matches(Limits::MODEL_PATTERN, $v[$f])) {
+                return [$f, 'ungültig'];
             }
         }
-        $webSearch = $r['web_search'] ?? 0;
-        $webFetch = $r['web_fetch'] ?? 0;
-        if ($webSearch < 0 || $webSearch > Limits::MAX_COUNT_PER_FIELD || $webFetch < 0 || $webFetch > Limits::MAX_COUNT_PER_FIELD) {
-            return 'web_search/web_fetch außerhalb des Bereichs';
-        }
-        $stop = $r['stop_reason'] ?? '';
-        if ($stop !== '' && !self::matches(Limits::STOP_PATTERN, $stop)) {
-            return 'stop_reason ungültig';
-        }
-        $tools = $r['tools'] ?? [];
-        if (count($tools) > Limits::MAX_TOOLS) {
-            return 'mehr als ' . Limits::MAX_TOOLS . ' Werkzeuge';
-        }
-        foreach ($tools as $name => $n) {
-            $n ??= 0;
-            // PHP macht aus Schlüsseln wie "123" ganze Zahlen; in Go sind es Texte.
-            if (!self::matches(Limits::TOOL_PATTERN, (string) $name) || $n < 1 || $n > Limits::MAX_COUNT_PER_FIELD) {
-                return 'Werkzeug ungültig';
+        foreach (['effort', 'entrypoint', 'stop_reason'] as $f) {
+            if (isset($v[$f]) && !self::matches(Limits::STOP_PATTERN, $v[$f])) {
+                return [$f, 'ungültig'];
             }
         }
-        $extra = $r['extra'] ?? [];
-        if (count($extra) > Limits::MAX_EXTRA_FIELDS) {
-            return 'mehr als ' . Limits::MAX_EXTRA_FIELDS . ' extra-Felder';
+        if (isset($v['cc_version']) && !self::matches(Limits::VERSION_PATTERN, $v['cc_version'])) {
+            return ['cc_version', 'ungültig'];
         }
-        foreach ($extra as $k => $v) {
-            if (!self::matches(Limits::EXTRA_KEY, (string) $k)) {
-                return 'extra-Schlüssel ungültig';
+        $tools = [];
+        if (isset($v['tools'])) {
+            $tools = get_object_vars($v['tools']);
+            if (count($tools) > Limits::MAX_TOOLS) {
+                return ['tools', 'mehr als ' . Limits::MAX_TOOLS . ' Werkzeuge'];
             }
-            if (is_int($v) || is_float($v)) {
-                if (is_float($v) && (is_nan($v) || is_infinite($v))) {
-                    return 'extra-Zahl ungültig';
+            foreach ($tools as $name => $n) {
+                // PHP macht aus Schlüsseln wie "123" ganze Zahlen; im JSON sind es Texte.
+                if (!self::matches(Limits::TOOL_PATTERN, (string) $name) || !is_int($n) || $n < 1 || $n > Limits::MAX_COUNT_PER_FIELD) {
+                    return ['tools', 'Werkzeug ungültig'];
                 }
-            } elseif (is_string($v)) {
-                if (mb_strlen($v, 'UTF-8') > Limits::MAX_EXTRA_STRING || self::hasControl($v) || self::hasSpoofChar($v)) {
-                    return 'extra-Text ungültig';
+            }
+        }
+        $count = 0;
+        $err = self::usageError($v['usage'], 1, $count);
+        if ($err !== null) {
+            return ['usage', $err];
+        }
+        $usage = $v['usage'];
+        $numbers = [];
+        foreach (self::USAGE_COUNTS as $name => $path) {
+            [$present, $x] = self::pathValue($usage, $path);
+            $max = in_array($name, ['web_search', 'web_fetch'], true) ? Limits::MAX_COUNT_PER_FIELD : Limits::MAX_TOKENS_PER_FIELD;
+            if ($present && (!is_int($x) || $x < 0 || $x > $max)) {
+                return ['usage.' . implode('.', $path), 'keine ganze Zahl im erlaubten Bereich'];
+            }
+            $numbers[$name] = $present ? $x : 0;
+        }
+        $extra = [];
+        $counted = array_map(static fn(array $p): string => $p[0], array_filter(self::USAGE_COUNTS, static fn(array $p): bool => count($p) === 1));
+        foreach (get_object_vars($usage) as $k => $x) {
+            $k = (string) $k;
+            if (!in_array($k, $counted, true) && (is_int($x) || is_float($x) || is_string($x))) {
+                $extra[$k] = $x;
+            }
+        }
+        ksort($extra, SORT_STRING);
+        $extra = array_slice($extra, 0, Limits::MAX_EXTRA_FIELDS, true);
+
+        $out = [
+            'message_id' => $v['message_id'], 'request_id' => $v['request_id'], 'session_id' => $v['session_id'],
+            'ts' => $v['ts'], 'ts_ms' => $ts[0] * 1000 + intdiv($ts[1], 1_000_000), 'utc_offset_min' => $v['utc_offset_min'],
+            'model' => $v['model'],
+        ] + $numbers + [
+            'stop_reason' => $v['stop_reason'] ?? '', 'subagent' => $v['subagent'], 'tools' => $tools,
+            'account_id' => $v['account_id'] ?? '', 'extra' => $extra,
+        ];
+        return null;
+    }
+
+    /**
+     * Prüft die Inhaltszeile eines Vorgeschichte-Tags und liest ihre Werte.
+     *
+     * $out bei Erfolg: date, models (Modell => Tokens, leer wenn nicht da), activity (messages, sessions, tool_calls
+     * oder null) und complete_before (Text oder null).
+     *
+     * @param mixed $o dekodierte Zeile
+     * @param array<string, mixed>|null $out
+     * @return array{0: string, 1: string}|null
+     */
+    public static function dayLine(mixed $o, int $nowMs, ?array &$out = null): ?array
+    {
+        $out = null;
+        $err = self::lineShape($o, 'day', self::DAY_LINE);
+        if ($err !== null) {
+            return $err;
+        }
+        $v = get_object_vars($o);
+        $err = self::checkLegacyDate($v['date'], $nowMs);
+        if ($err !== null) {
+            return ['date', substr($err, strlen('date: '))];
+        }
+        if (!isset($v['models']) && !isset($v['activity'])) {
+            return ['', 'models oder activity fehlt'];
+        }
+        $models = [];
+        if (isset($v['models'])) {
+            $models = get_object_vars($v['models']);
+            if (count($models) > Limits::MAX_LEGACY_MODELS) {
+                return ['models', 'mehr als ' . Limits::MAX_LEGACY_MODELS . ' Modelle'];
+            }
+            foreach ($models as $name => $tokens) {
+                if (!self::matches(Limits::MODEL_PATTERN, (string) $name) || !is_int($tokens) || $tokens < 0 || $tokens > Limits::MAX_LEGACY_NUMBER) {
+                    return ['models', 'Modell ungültig'];
                 }
-            } else {
-                return 'extra-Wert ist weder Zahl noch Text';
+            }
+        }
+        $activity = null;
+        if (isset($v['activity'])) {
+            $a = get_object_vars($v['activity']);
+            $fields = ['messages', 'sessions', 'tool_calls'];
+            if (array_diff(array_map('strval', array_keys($a)), $fields) !== []) {
+                return ['activity', 'unbekanntes Feld'];
+            }
+            foreach ($fields as $f) {
+                if (!array_key_exists($f, $a)) {
+                    return ["activity.$f", 'fehlt'];
+                }
+                if (!is_int($a[$f]) || $a[$f] < 0 || $a[$f] > Limits::MAX_LEGACY_NUMBER) {
+                    return ["activity.$f", 'außerhalb des Bereichs'];
+                }
+                $activity[$f] = $a[$f];
+            }
+        }
+        if (isset($v['complete_before'])) {
+            $err = self::legacyCompleteBefore($v['complete_before']);
+            if ($err !== null) {
+                return ['complete_before', $err];
+            }
+        }
+        $out = ['date' => $v['date'], 'models' => $models, 'activity' => $activity, 'complete_before' => $v['complete_before'] ?? null];
+        return null;
+    }
+
+    /**
+     * Form einer Inhaltszeile: ein Objekt, kind wie erwartet, nur Schlüssel aus $spec, Pflichtfelder da, jeder Wert vom
+     * richtigen Typ (null ist nie erlaubt: optionale Felder fehlen ganz).
+     *
+     * @param array<string, array{0: string, 1: bool}> $spec
+     * @return array{0: string, 1: string}|null
+     */
+    private static function lineShape(mixed $o, string $kind, array $spec): ?array
+    {
+        if (!$o instanceof \stdClass) {
+            return ['', 'kein JSON-Objekt'];
+        }
+        $v = get_object_vars($o);
+        if (!array_key_exists('kind', $v) || $v['kind'] !== $kind) {
+            return ['kind', 'nicht ' . $kind];
+        }
+        foreach ($v as $k => $_) {
+            if (!isset($spec[(string) $k])) {
+                // Den Namen aus der Zeile nie wiederholen.
+                return ['', 'unbekanntes Feld'];
+            }
+        }
+        foreach ($spec as $f => [$type, $required]) {
+            if (!array_key_exists($f, $v)) {
+                if ($required) {
+                    return [$f, 'fehlt'];
+                }
+                continue;
+            }
+            $x = $v[$f];
+            $ok = match ($type) {
+                'string' => is_string($x),
+                'int' => is_int($x),
+                'bool' => is_bool($x),
+                'object' => $x instanceof \stdClass,
+            };
+            if (!$ok) {
+                return [$f, self::TYPE_ERROR];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Wert unter $path in $usage: [true, Wert], wenn jeder Schritt ein Objekt mit diesem Schlüssel ist (auch mit Wert
+     * null), sonst [false, null].
+     *
+     * @param list<string> $path
+     * @return array{0: bool, 1: mixed}
+     */
+    private static function pathValue(\stdClass $usage, array $path): array
+    {
+        $node = $usage;
+        foreach ($path as $key) {
+            if (!$node instanceof \stdClass || !property_exists($node, $key)) {
+                return [false, null];
+            }
+            $node = $node->{$key};
+        }
+        return [true, $node];
+    }
+
+    /**
+     * Grenzen von usage (Tabelle „Grenzen“): Objekte und Listen höchstens USAGE_MAX_DEPTH Ebenen tief (usage ist
+     * Ebene 1), höchstens USAGE_MAX_VALUES Werte unterhalb von usage, Schlüssel nach EXTRA_KEY, Listen höchstens
+     * USAGE_MAX_LIST Einträge; Werte endliche Zahl, true, false, null, Text bis MAX_EXTRA_STRING Zeichen ohne Steuer-
+     * und Formatzeichen, Objekt oder Liste.
+     */
+    private static function usageError(\stdClass|array $node, int $depth, int &$count): ?string
+    {
+        if (is_array($node) && count($node) > Limits::USAGE_MAX_LIST) {
+            return 'Liste mit mehr als ' . Limits::USAGE_MAX_LIST . ' Einträgen';
+        }
+        foreach (is_array($node) ? $node : get_object_vars($node) as $k => $x) {
+            if ($node instanceof \stdClass && !self::matches(Limits::EXTRA_KEY, (string) $k)) {
+                return 'Schlüssel ungültig';
+            }
+            if (++$count > Limits::USAGE_MAX_VALUES) {
+                return 'mehr als ' . Limits::USAGE_MAX_VALUES . ' Werte';
+            }
+            if ($x instanceof \stdClass || is_array($x)) {
+                if ($depth + 1 > Limits::USAGE_MAX_DEPTH) {
+                    return 'mehr als ' . Limits::USAGE_MAX_DEPTH . ' Ebenen';
+                }
+                $err = self::usageError($x, $depth + 1, $count);
+                if ($err !== null) {
+                    return $err;
+                }
+            } elseif (is_float($x)) {
+                if (!is_finite($x)) {
+                    return 'Zahl ungültig';
+                }
+            } elseif (is_string($x)) {
+                if (mb_strlen($x, 'UTF-8') > Limits::MAX_EXTRA_STRING || self::hasControl($x) || self::hasSpoofChar($x)) {
+                    return 'Text ungültig';
+                }
             }
         }
         return null;
@@ -119,16 +335,12 @@ final class Validator
     /** @param array<mixed> $s */
     public static function session(array $s): ?string
     {
-        $err = self::types($s, ['session_id' => 'string', 'project_id' => 'string', 'cc_version' => 'string', 'account_id' => 'string']);
+        $err = self::types($s, ['session_id' => 'string', 'cc_version' => 'string', 'account_id' => 'string']);
         if ($err !== null) {
             return $err;
         }
         if (!self::matches(Limits::ID_PATTERN, $s['session_id'] ?? '')) {
             return 'session_id ungültig';
-        }
-        $project = $s['project_id'] ?? '';
-        if ($project !== '' && !self::matches(Limits::PROJECT_PATTERN, $project)) {
-            return 'project_id ungültig';
         }
         $version = $s['cc_version'] ?? '';
         if ($version !== '' && !self::matches(Limits::VERSION_PATTERN, $version)) {
@@ -199,47 +411,6 @@ final class Validator
         return null;
     }
 
-    /** Prüft einen Tageswert je Modell aus dem Altbestand. @param array<mixed> $d */
-    public static function legacyModel(array $d, int $nowMs): ?string
-    {
-        $err = self::types($d, ['date' => 'string', 'model' => 'string', 'tokens' => 'int']);
-        if ($err !== null) {
-            return $err;
-        }
-        $err = self::checkLegacyDate($d['date'] ?? '', $nowMs);
-        if ($err !== null) {
-            return $err;
-        }
-        if (!self::matches(Limits::MODEL_PATTERN, $d['model'] ?? '')) {
-            return 'model ungültig';
-        }
-        $tokens = $d['tokens'] ?? 0;
-        if ($tokens < 0 || $tokens > Limits::MAX_LEGACY_NUMBER) {
-            return 'tokens außerhalb des Bereichs';
-        }
-        return null;
-    }
-
-    /** Prüft einen Aktivitäts-Tageswert aus dem Altbestand. @param array<mixed> $d */
-    public static function legacyActivity(array $d, int $nowMs): ?string
-    {
-        $err = self::types($d, ['date' => 'string', 'messages' => 'int', 'sessions' => 'int', 'tool_calls' => 'int']);
-        if ($err !== null) {
-            return $err;
-        }
-        $err = self::checkLegacyDate($d['date'] ?? '', $nowMs);
-        if ($err !== null) {
-            return $err;
-        }
-        foreach (['messages', 'sessions', 'tool_calls'] as $f) {
-            $v = $d[$f] ?? 0;
-            if ($v < 0 || $v > Limits::MAX_LEGACY_NUMBER) {
-                return $f . ' außerhalb des Bereichs';
-            }
-        }
-        return null;
-    }
-
     /** Prüft einen vom Nutzer vergebenen Gerätenamen. */
     public static function deviceName(string $n): bool
     {
@@ -251,6 +422,71 @@ final class Validator
             return false;
         }
         return !self::hasControl($n) && !self::hasSpoofChar($n);
+    }
+
+    /**
+     * Prüft einen öffentlichen Signaturschlüssel (sign_public_key, Einträge von sign_public_keys_previous): Base64 im
+     * Standardalphabet mit Auffüllung, genau 44 Zeichen, 32 Byte. Nur die kanonische Form gilt (kodiert wieder genau
+     * zum gesendeten Text), damit ein Schlüssel nur eine Schreibweise hat.
+     *
+     * @return string|null die 32 Byte roh; null, wenn ungültig
+     */
+    public static function signKey(string $s): ?string
+    {
+        $raw = base64_decode($s, true);
+        if ($raw === false || strlen($raw) !== Limits::SIGN_KEY_BYTES || base64_encode($raw) !== $s) {
+            return null;
+        }
+        return $raw;
+    }
+
+    /**
+     * true, wenn die Plugin-Version älter als $min ist (Abschnitt „Mindestversion“ in protocol/doc.md): verglichen
+     * werden die drei Zahlen x.y.z am Anfang, Zahl für Zahl; ein Zusatz danach zählt nicht. Eine Version, die nicht
+     * mit x.y.z beginnt, gilt als zu alt. Die Zahlen werden als Ziffernfolgen verglichen, damit lange Zahlen nicht
+     * überlaufen.
+     */
+    public static function pluginOutdated(string $version, string $min = Limits::MIN_PLUGIN_VERSION): bool
+    {
+        $parts = static function (string $v): ?array {
+            if (preg_match('/^([0-9]+)\.([0-9]+)\.([0-9]+)/', $v, $m) !== 1) {
+                return null;
+            }
+            return array_map(static fn(string $n): string => ltrim($n, '0'), array_slice($m, 1));
+        };
+        $have = $parts($version);
+        $want = $parts($min);
+        if ($have === null || $want === null) {
+            return true;
+        }
+        foreach ($have as $i => $n) {
+            $cmp = strlen($n) <=> strlen($want[$i]) ?: strcmp($n, $want[$i]) <=> 0;
+            if ($cmp !== 0) {
+                return $cmp < 0;
+            }
+        }
+        return false;
+    }
+
+    /** Prüft die Kennung des Rechners beim Koppeln (device_source): genau 64 Hex-Zeichen, klein. */
+    public static function deviceSource(string $s): bool
+    {
+        return preg_match(Limits::DEVICE_SOURCE_PATTERN, $s) === 1;
+    }
+
+    /**
+     * Prüft complete_before eines Vorgeschichte-Tags: YYYY-MM-DD und ein gültiges Kalenderdatum; die Zukunft ist erlaubt
+     * (sie wirkt beim Speichern nur bis heute). Ein fehlendes Feld prüft der Aufrufer nicht.
+     */
+    public static function legacyCompleteBefore(mixed $s): ?string
+    {
+        if (!self::matches(Limits::LEGACY_DATE_PATTERN, $s)) {
+            return 'Format YYYY-MM-DD erwartet';
+        }
+        if (!self::validDate((int) substr($s, 0, 4), (int) substr($s, 5, 2), (int) substr($s, 8, 2))) {
+            return 'kein gültiges Datum';
+        }
+        return null;
     }
 
     /** Steuerzeichen (Unicode Cc), wie unicode.IsControl. */

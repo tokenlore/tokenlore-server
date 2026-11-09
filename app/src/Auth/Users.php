@@ -39,7 +39,7 @@ final class Users
         $hash = Password::hash($pw);
         $salt = random_bytes(32);
         return $this->db->tx(static function (PDO $pdo) use ($username, $hash, $salt, $role): int {
-            $st = $pdo->prepare('insert into users (username, pw_hash, project_salt, role) values (?, ?, ?, ?)');
+            $st = $pdo->prepare('insert into users (username, pw_hash, source_salt, role) values (?, ?, ?, ?)');
             $st->bindValue(1, $username);
             $st->bindValue(2, $hash);
             $st->bindValue(3, $salt, PDO::PARAM_LOB);

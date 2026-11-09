@@ -21,7 +21,8 @@ final class Plausibility
      * Gezählt werden alle gespeicherten Anfragen der Sitzung (Subagenten tragen dieselbe session_id) je Sekunde und
      * je Minute in UTC (ts in Millisekunden, Kalendergrenzen). Ab flag_per_second bzw. flag_per_minute des Nutzers
      * (Zahl ≥ Grenze) wird flagged gesetzt, Grund '≥50/s' bzw. '≥500/min'; bei beiden gewinnt die Sekunde.
-     * Eine gesetzte Markierung wird nie entfernt. Fehlt die Sitzungszeile noch, wird sie ohne device_id angelegt.
+     * Eine gesetzte Markierung wird nie entfernt. Fehlt die Sitzungszeile noch, wird sie ohne device_id angelegt;
+     * die Zeile eines anderen Benutzers bleibt unberührt (Store übergibt nur eigene Sitzungen).
      * Zurück kommen alle aktuell markierten Sitzungen unter den geprüften (neu oder schon vorher), sortiert.
      * Läuft in der Transaktion des Aufrufers (Store), öffnet selbst keine.
      *
@@ -53,7 +54,8 @@ final class Plausibility
                 cross join (select coalesce((select flag_per_second from settings where user_id = :uid), :dps) as ps,
                                    coalesce((select flag_per_minute from settings where user_id = :uid), :dpm) as pm) cfg
             ) where reason is not null
-            on conflict (user_id, session_id) do update set flagged = 1, flag_reason = excluded.flag_reason
+            on conflict (session_id) do update set flagged = 1, flag_reason = excluded.flag_reason
+              where sessions.user_id = excluded.user_id
             SQL);
         $st->bindValue(':uid', $uid, \PDO::PARAM_INT);
         $st->bindValue(':ids', $json);
