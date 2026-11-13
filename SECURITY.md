@@ -3,7 +3,7 @@
 ## Unterstützte Versionen
 
 Sicherheitskorrekturen gibt es nur für die jeweils neueste Version (der neueste Tag bzw. der Zweig `main`). Halte deine
-Installation deshalb aktuell; wie, steht in [docs/betrieb.md](docs/betrieb.md#5-updates).
+Installation deshalb aktuell; wie, steht in [docs/betrieb.md](docs/betrieb.md#5-updates). <!-- doku-ok: Ziel liegt im veröffentlichten Stand -->
 
 ## Eine Lücke melden
 
@@ -30,5 +30,5 @@ PHP, im Webserver oder beim Hoster gehören zu deren Betreibern.
 
 ## Was tokenlore bewusst nicht leistet
 
-Die [Bekannten Grenzen](docs/betrieb.md#8-bekannte-grenzen) in der Betriebsanleitung (etwa: wer den Server betreibt,
+Die [Bekannten Grenzen](docs/betrieb.md#8-bekannte-grenzen) in der Betriebsanleitung (etwa: wer den Server betreibt, <!-- doku-ok: Ziel liegt im veröffentlichten Stand -->
 sieht alle Zahlen) sind keine Lücken, sondern beschriebene Eigenschaften.

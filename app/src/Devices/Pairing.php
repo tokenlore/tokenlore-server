@@ -10,6 +10,7 @@ use PDOStatement;
 use RuntimeException;
 use Tokenlore\Db\Database;
 use Tokenlore\Protocol\Limits;
+use Tokenlore\Util\Time;
 
 // Kopplung per Kurzcode (devices/pairing.go). BEGIN IMMEDIATE ersetzt den globalen Advisory-Lock:
 // Erzeugen und Einlösen laufen nacheinander, Fehlversuche zählen global.
@@ -26,6 +27,8 @@ final class Pairing
     /** Benutzte und abgelaufene Codes räumt das Erzeugen nach diesem Alter ab (Sekunden nach Ablauf). */
     private const CLEANUP_AFTER = 86400;
     private const KEY_PREFIX = 'tl_dk_';
+    /** Liegt die letzte Lieferung des Vorgängers weniger Sekunden zurück, gilt er als in Gebrauch (recent). */
+    public const PREDECESSOR_RECENT = 86400;
 
     private readonly Closure $genCode;
 
@@ -104,16 +107,27 @@ final class Pairing
      * früheren weg (Devices::capSignKeys); der aktuelle bleibt immer. Jeder angenommene Nachweis (Schlüssel und Code)
      * gilt nur einmal, auch wenn newCode den Code später neu vergibt (pair_proofs, Entscheidung Z9 a).
      *
+     * Vorgänger (protocol/doc.md, „Vorgänger“): Gilt der Code für kein bestimmtes Gerät, ist $source dem Nutzer unbekannt
+     * und gehört $predecessorSource einem Gerät A des Nutzers (über device_sources, nach einem Zusammenlegen also dem
+     * aufnehmenden Gerät), fragt redeem ohne $predecessorAnswer nach (PredecessorQuestion, nichts geändert, Code und
+     * Besitznachweis bleiben unverbraucht). 'same' koppelt A neu wie ein Code für A; 'new' und 'later' legen ein neues
+     * Gerät B an und merken das Paar (B, A) in device_predecessors als 'rejected' bzw. 'open'. Steht keine Frage an,
+     * wird $predecessorAnswer übergangen. Ein Eintrag für das Paar kann hier nicht schon bestehen: B gibt es erst, wenn
+     * $source bekannt ist, und dann fragt redeem nicht.
+     *
      * @param string $source Kennung des Rechners (device_source, geprüft mit Validator::deviceSource)
      * @param bool $nameExplicit Name ausdrücklich gewählt (device_name_explicit, Plugin mit --name)
      * @param string|null $signKey aktueller Signaturschlüssel (sign_public_key), 32 Byte roh
      * @param list<string> $previousSignKeys frühere Signaturschlüssel (sign_public_keys_previous), je 32 Byte roh
      * @param string|null $pluginVersion gemeldete Plugin-Version; null lässt devices.plugin_version unverändert
+     * @param string|null $predecessorSource Kennung des Vorgängers (predecessor_source, geprüft mit Validator::deviceSource)
+     * @param 'same'|'new'|'later'|null $predecessorAnswer Antwort auf die Frage (predecessor_answer)
      * @return array{device_id:int, key:string, user_id:int, repaired:bool, sign_keys_refused:list<string>} abgelehnte
      *         Schlüssel roh, in der gesendeten Reihenfolge (aktueller zuerst), ohne Doppelte
      * @throws BadCodeException
      * @throws SourceTaken Code für ein Gerät, Kennung gehört einem anderen Gerät desselben Nutzers (nichts geändert)
      * @throws ProofReused derselbe Schlüssel wurde mit diesem Code schon einmal gekoppelt (nichts geändert)
+     * @throws PredecessorQuestion Frage nach dem Vorgänger (nichts geändert)
      */
     public function redeem(
         string $code,
@@ -126,8 +140,10 @@ final class Pairing
         ?string $signKey = null,
         array $previousSignKeys = [],
         ?string $pluginVersion = null,
+        ?string $predecessorSource = null,
+        ?string $predecessorAnswer = null,
     ): array {
-        $result = $this->db->tx(function (PDO $pdo) use ($code, $name, $os, $arch, $source, $now, $nameExplicit, $signKey, $previousSignKeys, $pluginVersion): ?array {
+        $result = $this->db->tx(function (PDO $pdo) use ($code, $name, $os, $arch, $source, $now, $nameExplicit, $signKey, $previousSignKeys, $pluginVersion, $predecessorSource, $predecessorAnswer): ?array {
             // Codes gesperrter Konten (users.disabled_at) gelten nicht; sie zählen wie ein falscher Code.
             $find = $pdo->prepare(
                 'select c.id, c.user_id, c.device_id from pair_codes c join users u on u.id = c.user_id
@@ -170,6 +186,26 @@ final class Pairing
                 if ((int) $seen->fetchColumn() === 1) {
                     throw new ProofReused($uid);
                 }
+                $seen->closeCursor();
+            }
+            // Vorgänger erst nach allen anderen Prüfungen und vor dem Merken des Nachweises: Die Frage verbraucht weder
+            // Code noch Nachweis, das Plugin koppelt danach mit beiden und der Antwort erneut.
+            $predecessor = null;
+            if ($row['device_id'] === null && $known === null && $predecessorSource !== null) {
+                $src->execute([$uid, self::storedSource($predecessorSource, $salt)]);
+                $found = $src->fetchColumn();
+                $predecessor = $found === false ? null : (int) $found;
+            }
+            $sent = $signKey === null ? $previousSignKeys : [$signKey, ...$previousSignKeys];
+            if ($predecessor !== null && $predecessorAnswer === null) {
+                $info = self::predecessorInfo($pdo, $predecessor, $now, $sent);
+                // Die Ausnahme rollt die Transaktion zurück: Der Code bleibt gültig, nichts wird geändert.
+                throw new PredecessorQuestion($uid, $info, self::recommendation($info));
+            }
+            if ($predecessor !== null && $predecessorAnswer === 'same') {
+                $deviceId = $predecessor;
+            }
+            if ($signKey !== null) {
                 $mark = $pdo->prepare('insert into pair_proofs (fingerprint, used_at) values (?, ?)');
                 $mark->bindValue(1, $fp, PDO::PARAM_LOB);
                 $mark->bindValue(2, $now, PDO::PARAM_INT);
@@ -192,6 +228,13 @@ final class Pairing
             }
             if ($pluginVersion !== null) {
                 $pdo->prepare('update devices set plugin_version = ? where id = ?')->execute([$pluginVersion, $deviceId]);
+            }
+            if ($predecessor !== null && !$repaired) {
+                // 'new': nie wieder fragen; 'later': die Webseite fragt (Teil der Geräteliste). sign_key_match jetzt
+                // merken: Unten nimmt B den aktuellen Signaturschlüssel an sich, danach hat A ihn nicht mehr.
+                $pdo->prepare('insert into device_predecessors (user_id, device_id, predecessor_id, state, created_at, sign_key_match) values (?, ?, ?, ?, ?, ?)')
+                    ->execute([$uid, $deviceId, $predecessor, $predecessorAnswer === 'later' ? 'open' : 'rejected', $now,
+                        self::signKeyMatch($pdo, $predecessor, $sent) ? 1 : 0]);
             }
             if ($known === null) {
                 $pdo->prepare('insert into device_sources (user_id, source, device_id) values (?, ?, ?)')
@@ -260,6 +303,57 @@ final class Pairing
     public static function storedSource(string $source, string $salt): string
     {
         return hash_hmac('sha256', $source, $salt);
+    }
+
+    /**
+     * Angaben zum Vorgänger A für die Frage, Feldnamen wie im Protokoll. recent: letzte Lieferung weniger als
+     * PREDECESSOR_RECENT Sekunden vor $now; sign_key_match: einer der gesendeten Signaturschlüssel ist einer von A
+     * (gleich ob an einem Geräteschlüssel, gesperrt oder als früherer).
+     *
+     * Dieselbe Rechnung für die Frage auf der Webseite (Devices::predecessorHints).
+     *
+     * @param list<string> $sent gesendete Signaturschlüssel, 32 Byte roh
+     * @return array{device_id:int, name:string, last_seen_at:string|null, os:string, arch:string, recent:bool, sign_key_match:bool}
+     */
+    public static function predecessorInfo(PDO $pdo, int $deviceId, int $now, array $sent): array
+    {
+        $st = $pdo->prepare('select name, os, arch, last_seen_at from devices where id = ?');
+        $st->execute([$deviceId]);
+        $d = $st->fetch(PDO::FETCH_ASSOC);
+        $st->closeCursor();
+        $seen = $d['last_seen_at'] === null ? null : (int) $d['last_seen_at'];
+        return [
+            'device_id' => $deviceId,
+            'name' => (string) $d['name'],
+            'last_seen_at' => $seen === null ? null : Time::isoMs($seen * 1000),
+            'os' => (string) $d['os'],
+            'arch' => (string) $d['arch'],
+            'recent' => $seen !== null && $now - $seen < self::PREDECESSOR_RECENT,
+            'sign_key_match' => self::signKeyMatch($pdo, $deviceId, $sent),
+        ];
+    }
+
+    /**
+     * Empfehlung zur Frage nach dem Vorgänger: Hat A kürzlich geliefert (recent), scheint es noch in Gebrauch, also
+     * 'new'; sonst 'same'. Nur die Empfehlung hängt daran, entschieden wird vom Nutzer.
+     *
+     * @param array{recent:bool} $info Angaben zu A (predecessorInfo)
+     * @return 'same'|'new'
+     */
+    public static function recommendation(array $info): string
+    {
+        return $info['recent'] ? 'new' : 'same';
+    }
+
+    /**
+     * true, wenn einer der Signaturschlüssel $sent (32 Byte roh) Gerät $deviceId gehört, gleich ob an einem
+     * Geräteschlüssel, gesperrt oder als früherer.
+     *
+     * @param list<string> $sent
+     */
+    private static function signKeyMatch(PDO $pdo, int $deviceId, array $sent): bool
+    {
+        return $sent !== [] && array_intersect($sent, Devices::signKeysIn($pdo, $deviceId)) !== [];
     }
 
     /** true, wenn ein anderes Gerät als $deviceId (gleich welchen Benutzers) den Signaturschlüssel schon hat. */

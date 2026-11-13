@@ -4,6 +4,17 @@ Was sich für dich als Betreiber ändert, je Version. Format nach [Keep a Change
 
 ## Unveröffentlicht
 
+## 0.4.0 – 2026-11-13
+
+### Neu
+
+- Stellst du einen Rechner aus einer Sicherung wieder her oder kopierst seinen Konfigurationsordner auf einen neuen Rechner, fragt das Plugin beim Koppeln, ob er das alte Gerät ist. Es empfiehlt eine Antwort und warnt, wenn das alte Gerät vor Kurzem noch geliefert hat. Bei „Ja“ wird das alte Gerät neu gekoppelt, seine Zahlen bleiben, und der andere Rechner liefert nicht mehr, bis du ihn neu koppelst. Bei „Nein“ wird es ein neues Gerät, und die Frage kommt nicht wieder. Bei „Später“ wird es ein neues Gerät, und die Geräteliste fragt dich, sobald du entscheiden willst.
+- Die Geräteliste zeigt bei so einem Gerät den Hinweis mit Empfehlung und den Folgen je Antwort; für dieses Paar fragt sie nicht zusätzlich „Zusammenlegen?“.
+
+### Doku
+
+- Die Betriebsanleitung erklärt die Frage nach dem alten Gerät beim Koppeln und auf der Seite „Geräte“.
+
 ## 0.3.0 – 2026-11-09
 
 ### Neu

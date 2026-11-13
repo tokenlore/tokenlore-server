@@ -443,11 +443,40 @@ ein anderes Gerät schon mit genau denselben Werten hat, zählt nur dieses.
 Zusammenlegen?“. Erst wenn du auf „Zusammenlegen …“ klickst und bestätigst, wird aus beiden ein Gerät: Zahlen,
 Schlüssel und Kennungen gehen auf das verbleibende Gerät über, nichts zählt doppelt, und das Plugin sendet ohne neue
 Kopplung weiter. Das lässt sich nicht rückgängig machen. Ohne deine Bestätigung legt der Server nie Geräte zusammen.
+Hast du bei der Frage nach dem Vorgänger (siehe unten) „Nein“ gewählt, schlägt die Seite diese beiden Geräte nie zum
+Zusammenlegen vor.
 
-**Claude-Ordner kopiert.** Hast du den Ordner `~/.claude` von einem anderen Rechner kopiert, liefert das Plugin dort
-nichts, bis du neu koppelst. Beim Koppeln wird der Rechner ohne Rückfrage ein eigenes Gerät; Anfragen, die schon der
-ursprüngliche Rechner geliefert hat, zählen nicht doppelt. Ziehst du ganz auf einen neuen Rechner um, sperre das alte
-Gerät auf der Seite „Geräte“.
+**Claude-Ordner kopiert oder aus einer Sicherung geholt.** Hast du einen Rechner neu aufgesetzt und `~/.claude` aus
+einer Sicherung zurückgeholt, oder den Ordner von einem anderen Rechner kopiert, liefert das Plugin dort nichts, bis
+du neu koppelst. Gehört der ursprüngliche Rechner auf deinem Server zu deinen Geräten, fragt `/tokenlore:connect` in
+Claude Code in einem Auswahlfenster, ob dieser Rechner das alte Gerät ist. Die Frage nennt das alte Gerät und seine
+letzte Lieferung, jede Antwort sagt kurz, was danach passiert, und die empfohlene steht zuerst:
+
+- Hat das alte Gerät in den letzten 24 Stunden geliefert, scheint es in Gebrauch zu sein. Die Frage warnt davor und
+  empfiehlt „Nein“.
+- Sonst empfiehlt sie „Ja“, etwa nach einem neu aufgesetzten Rechner.
+
+Entscheiden musst du; der Server entscheidet nie allein. Was nach jeder Antwort passiert:
+
+- **„Ja: dieser Rechner wird „…““:** Der Rechner macht als das alte Gerät weiter, mit allen Zahlen. Die älteren Tage
+  aus dem zurückgeholten Ordner zählen nicht zusätzlich zu Tagen, an denen das alte Gerät schon einzelne Anfragen
+  geliefert hat. Liefert ein anderer Rechner als dieses Gerät, liefert er danach nichts, bis du ihn neu koppelst.
+- **„Nein: eigenes Gerät …“:** Der Rechner wird ein eigenes Gerät, das alte liefert unverändert weiter. Alte Tage, die
+  beide aus demselben Ordner haben, können doppelt zählen. Für diese beiden Geräte kommt die Frage nie wieder, weder
+  in Claude Code noch auf der Webseite.
+- **„Später: eigenes Gerät, auf der Webseite entscheiden“:** Der Rechner wird ein eigenes Gerät und liefert. Die Seite „Geräte“ zeigt
+  oben die Frage mit denselben Angaben, derselben Empfehlung und den Folgen je Antwort, dazu die Zahl gleicher Tage
+  beider Geräte. „Ja, derselbe Rechner“ legt beide Geräte sofort zusammen und wirkt wie „Ja“ in Claude Code; das lässt
+  sich nicht rückgängig machen. „Nein, ein anderer Rechner“ wirkt wie „Nein“ in Claude Code.
+
+Schließt du das Fenster ohne Antwort, wird nichts gekoppelt; der Code bleibt bis zu seinem Ablauf gültig, und Claude
+Code zeigt die drei fertigen Befehle zum Antworten. Die Antwort lässt sich auch gleich beim Koppeln mitgeben, etwa
+`/tokenlore:connect … --vorgaenger gleich` (Ja), `--vorgaenger neu` (Nein) oder `--vorgaenger spaeter` (Später).
+
+Keine Frage kommt, wenn der ursprüngliche Rechner auf deinem Server nicht zu deinen Geräten gehört, wenn du einen Code
+für ein bestimmtes Gerät benutzt oder wenn der Server den Rechner schon kennt. Dann wird gekoppelt wie oben
+beschrieben; Anfragen, die schon der ursprüngliche Rechner geliefert hat, zählen nicht doppelt. Ziehst du ganz auf
+einen neuen Rechner um, ohne den Ordner mitzunehmen, sperre das alte Gerät auf der Seite „Geräte“.
 
 **Hinweis „lag schon bei einem anderen Benutzer oder Gerät“.** Jede Anfrage und jede Sitzung zählt auf dem Server nur
 einmal, bei dem Benutzer, der sie zuerst geliefert hat. Liefert ein anderer Benutzer dieselbe Anfrage oder arbeitet er

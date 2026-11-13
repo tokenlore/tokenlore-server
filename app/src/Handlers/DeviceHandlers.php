@@ -20,7 +20,8 @@ use Tokenlore\Util\Names;
 use Tokenlore\Util\Time;
 
 // Geräte der angemeldeten Nutzer (internal/httpapi/device_handlers.go, manage_handlers.go): Kopplungscode erzeugen,
-// auflisten (mit Hinweisen zum Zusammenlegen), sperren, umbenennen, zusammenlegen. Alle Routen verlangen Sitzung und CSRF-Token (bei GET entfällt es).
+// auflisten (mit Hinweisen zum Zusammenlegen und Fragen nach dem Vorgänger), sperren, umbenennen, zusammenlegen, die
+// Frage nach dem Vorgänger beantworten. Alle Routen verlangen Sitzung und CSRF-Token (bei GET entfällt es).
 final class DeviceHandlers
 {
     private const NOT_FOUND = 'Gerät nicht gefunden';
@@ -71,6 +72,13 @@ final class DeviceHandlers
         $router->add('POST', '/api/devices/{id}/revoke', $session($h->revoke(...)));
         $router->add('POST', '/api/devices/{id}/merge', Middleware::chain(
             $h->merge(...),
+            $mw->requireSession(),
+            $mw->requireCsrf(),
+            $mw->jsonOnly(),
+            $mw->maxBody(4096),
+        ));
+        $router->add('POST', '/api/devices/{id}/predecessor', Middleware::chain(
+            $h->predecessor(...),
             $mw->requireSession(),
             $mw->requireCsrf(),
             $mw->jsonOnly(),
@@ -128,7 +136,9 @@ final class DeviceHandlers
     }
 
     /**
-     * Geräte des Nutzers und Hinweise zum Zusammenlegen: {"devices": [...], "merge_hints": [{"from": B, "into": A}]}.
+     * Geräte des Nutzers, Hinweise zum Zusammenlegen und offene Fragen nach dem Vorgänger:
+     * {"devices": [...], "merge_hints": [{"from": B, "into": A}], "predecessor_hints": [{"device_id": B,
+     * "predecessor": {…}, "recommended": "same"|"new", "overlap_days": n}]} (Devices::predecessorHints).
      * Scheitert das Berechnen der Hinweise, kommt die Liste trotzdem, mit leeren Hinweisen; der Fehler geht ins Log.
      *
      * @param array<string,string> $params
@@ -137,14 +147,48 @@ final class DeviceHandlers
     {
         $uid = (int) $r->attr('uid');
         $devices = $this->devices->list($uid);
+        $hints = $this->hints('Hinweise zum Zusammenlegen', fn(): array => $this->devices->mergeCandidates($uid));
+        $pred = $this->hints('Fragen nach dem Vorgänger', fn(): array => $this->devices->predecessorHints($uid, ($this->clock)()));
+        return Response::json(200, ['devices' => $devices, 'merge_hints' => $hints, 'predecessor_hints' => $pred]);
+    }
+
+    /**
+     * Hinweise aus $fn; bei einem Fehler eine leere Liste, die Ursache ins Fehlerprotokoll (wie Kernel::handle: nach
+     * außen nichts).
+     *
+     * @param callable(): list<mixed> $fn
+     * @return list<mixed>
+     */
+    private function hints(string $what, callable $fn): array
+    {
         try {
-            $hints = $this->devices->mergeCandidates($uid);
+            return $fn();
         } catch (\Throwable $e) {
-            // Wie Kernel::handle: nach außen nichts, die Ursache ins Fehlerprotokoll.
-            ($this->log)(sprintf('Hinweise zum Zusammenlegen: %s: %s in %s:%d', $e::class, $e->getMessage(), $e->getFile(), $e->getLine()));
-            $hints = [];
+            ($this->log)(sprintf('%s: %s: %s in %s:%d', $what, $e::class, $e->getMessage(), $e->getFile(), $e->getLine()));
+            return [];
         }
-        return Response::json(200, ['devices' => $devices, 'merge_hints' => $hints]);
+    }
+
+    /**
+     * Antwort auf die Frage nach dem Vorgänger für Gerät {id} (B) mit {"answer": "same"|"new"} (Devices::answerPredecessor).
+     * Andere Antwort oder Rumpf: 400; kein offenes Paar für B beim Nutzer (unbekannt, fremd, schon beantwortet): 404.
+     *
+     * @param array<string,string> $params
+     */
+    private function predecessor(Request $r, array $params): Response
+    {
+        $body = StrictJson::strings($r->body, ['answer']);
+        if ($body === null || !in_array($body['answer'], ['same', 'new'], true)) {
+            return Response::error(400, 'Ungültige Anfrage');
+        }
+        $id = self::deviceId($params['id'] ?? '');
+        $uid = (int) $r->attr('uid');
+        $a = $id === null ? null : $this->devices->answerPredecessor($uid, $id, $body['answer'], ($this->clock)());
+        if ($a === null) {
+            return Response::error(404, self::NOT_FOUND);
+        }
+        $this->audit->request($r, 'vorgaenger_beantwortet', $uid, ['geraet' => $id, 'vorgaenger' => $a, 'antwort' => $body['answer']]);
+        return Response::empty();
     }
 
     /**

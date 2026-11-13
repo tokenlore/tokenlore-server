@@ -9,6 +9,7 @@ use Tokenlore\Audit;
 use Tokenlore\Config\ServerSettings;
 use Tokenlore\Devices\BadCodeException;
 use Tokenlore\Devices\Pairing;
+use Tokenlore\Devices\PredecessorQuestion;
 use Tokenlore\Devices\ProofReused;
 use Tokenlore\Devices\SourceTaken;
 use Tokenlore\Http\Middleware;
@@ -23,6 +24,15 @@ use Tokenlore\Protocol\Validator;
 // Die Datenannahme (POST /api/plugin/ingest) liegt in einer eigenen Klasse.
 final class PluginHandlers
 {
+    /**
+     * Merkmale in GET /api/plugin/info (protocol/doc.md, „Server-Kennung“). predecessor: Koppeln nimmt
+     * predecessor_source und predecessor_answer an und fragt nach dem Vorgänger.
+     */
+    public const FEATURES = ['predecessor'];
+
+    /** Gültige Werte von predecessor_answer, genau so geschrieben. */
+    private const PREDECESSOR_ANSWERS = ['same', 'new', 'later'];
+
     private function __construct(
         private readonly Pairing $pairing,
         private readonly ServerSettings $settings,
@@ -46,8 +56,9 @@ final class PluginHandlers
     }
 
     /**
-     * Kennung des Servers und älteste angenommene Plugin-Version. Beides ist öffentlich: server_id ist ohne die
-     * Kennung des Rechners wertlos, die Mindestversion steht im Code.
+     * Kennung des Servers, älteste angenommene Plugin-Version und Merkmale über die Grundform des Protokolls hinaus
+     * (FEATURES). Alles öffentlich: server_id ist ohne die Kennung des Rechners wertlos, Mindestversion und Merkmale
+     * stehen im Code.
      *
      * @param array<string,string> $params
      */
@@ -56,6 +67,7 @@ final class PluginHandlers
         return Response::json(200, [
             'server_id' => $this->settings->serverId(),
             'min_plugin_version' => Limits::MIN_PLUGIN_VERSION,
+            'features' => self::FEATURES,
         ]);
     }
 
@@ -71,7 +83,8 @@ final class PluginHandlers
     {
         $text = ['code', 'device_name', 'os', 'arch', 'device_source', 'plugin_version', 'sign_public_key', 'sign_public_key_proof'];
         [$v, , $field] = StrictJson::decode($r->body, array_fill_keys($text, 'string')
-            + ['device_name_explicit' => 'bool', 'sign_public_keys_previous' => 'string[]']);
+            + ['device_name_explicit' => 'bool', 'sign_public_keys_previous' => 'string[]',
+                'predecessor_source' => 'string', 'predecessor_answer' => 'string']);
         $bad = static fn(string $msg, string $path): Response => Response::json(400, ['error' => $msg, 'path' => $path]);
         if ($v === null) {
             return $field === '' ? Response::error(400, 'Ungültige Anfrage') : $bad('Ungültige Anfrage', $field);
@@ -123,10 +136,19 @@ final class PluginHandlers
             }
             $previousRaw[] = $raw;
         }
+        // Vorgänger (optional): ein vorhandener Wert muss gültig sein, auch wenn keine Frage ansteht.
+        $predSource = $v['predecessor_source'] ?? null;
+        if ($predSource !== null && !Validator::deviceSource($predSource)) {
+            return $bad('Kennung des Vorgängers ungültig (64 Hex-Zeichen, klein)', 'predecessor_source');
+        }
+        $predAnswer = $v['predecessor_answer'] ?? null;
+        if ($predAnswer !== null && !in_array($predAnswer, self::PREDECESSOR_ANSWERS, true)) {
+            return $bad('Antwort zum Vorgänger ungültig (same, new oder later)', 'predecessor_answer');
+        }
         try {
             $paired = $this->pairing->redeem(
                 $req['code'], $req['device_name'], $req['os'], $req['arch'], $req['device_source'], ($this->clock)(), $explicit,
-                $signKey, $previousRaw, $req['plugin_version'],
+                $signKey, $previousRaw, $req['plugin_version'], $predSource, $predAnswer,
             );
         } catch (BadCodeException $e) {
             $this->audit->request($r, 'kopplung_fehlgeschlagen', null);
@@ -134,6 +156,10 @@ final class PluginHandlers
         } catch (SourceTaken $e) {
             $this->audit->request($r, 'kopplung_abgelehnt', $e->userId);
             return Response::error(409, $e->getMessage());
+        } catch (PredecessorQuestion $e) {
+            // Nur Angaben und Empfehlung; Fragetext und Folgen formuliert das Plugin. Code und Nachweis bleiben gültig.
+            $this->audit->request($r, 'kopplung_frage_vorgaenger', $e->userId, ['geraet' => $e->predecessor['device_id']]);
+            return Response::json(409, ['error' => 'predecessor_question', 'predecessor' => $e->predecessor, 'recommended' => $e->recommended]);
         } catch (ProofReused $e) {
             // Ein Nachweis gilt nur einmal (Entscheidung Z9 a); der Code bleibt gültig.
             $this->audit->request($r, 'kopplung_abgelehnt', $e->userId);
