@@ -1,1 +1,0 @@
-import{s as e,t}from"./DrxU2Npq.js";async function n(n){try{return{allowed:e(await n())===`admin`}}catch(e){return e instanceof t&&(e.status===401||e.status===403)?{allowed:!1}:{allowed:null,error:e}}}async function r(t){try{return e(await t())===`member`}catch{return!1}}export{r as n,n as t};

@@ -164,8 +164,9 @@ final class Decoder
      * Paketform und Grenzen (Version, Gerät, Konten, Sitzungen, Hüllen), dann die Signatur jeder Zeile gegen $signKeys,
      * dann jede Inhaltszeile. Der erste Fehler bricht ab.
      *
-     * Ergebnis: das Paket, in dem requests die gelesenen Anfragen (Validator::requestLine) und legacy_days die
-     * gelesenen Tage (Validator::dayLine) sind, je mit z und s wie geliefert.
+     * Ergebnis: das Paket, in dem requests die gelesenen Anfragen und Fehlerzeilen (Validator::requestLine und
+     * errorLine, unterschieden an kind) und legacy_days die gelesenen Tage (Validator::dayLine) sind, je mit z und s
+     * wie geliefert.
      *
      * @param array<string, mixed> $b Ergebnis von decode()
      * @param int $nowMs Uhr des Servers in Millisekunden
@@ -243,7 +244,9 @@ final class Decoder
                 if ($err !== null) {
                     throw new IngestError(self::join($path, $err[0]), $err[1]);
                 }
-                $err = Validator::$check($line, $nowMs, $out);
+                // In requests stehen Anfragen und Fehlerzeilen; unterschieden wird nach kind.
+                $lineCheck = $list === 'requests' && $line instanceof stdClass && ($line->kind ?? null) === 'error' ? 'errorLine' : $check;
+                $err = Validator::$lineCheck($line, $nowMs, $out);
                 if ($err !== null) {
                     throw new IngestError(self::join($path, $err[0]), $err[1]);
                 }

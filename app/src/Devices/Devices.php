@@ -436,7 +436,7 @@ final class Devices
     }
 
     /**
-     * Legt Gerät $from in Gerät $into zusammen, beide vom Nutzer, in einer Transaktion: Anfragen und Sitzungen gehen
+     * Legt Gerät $from in Gerät $into zusammen, beide vom Nutzer, in einer Transaktion: Anfragen, Fehlerzeilen und Sitzungen gehen
      * an $into; von der Vorgeschichte bleibt je Tag die Zeile mit der größeren Summe der Tokens als Ganzes (bei
      * Gleichstand die von $into), samt Modellen und Aktivität des Tags; die Treffer „schon woanders“
      * (elsewhere_hits) gehen an $into, ein gleicher Schlüssel bleibt eine Zeile (je Feld das Maximum, der frühere
@@ -446,7 +446,7 @@ final class Devices
      * zuletzt gemeldete aktuelle Signaturschlüssel ist sicher (die übrigen zählen als frühere); offene Kopplungscodes für $from und seine Liefersperre fallen weg; $from wird
      * gelöscht. Hat $into danach einen aktiven Schlüssel, ist seine Sperre aufgehoben, sonst bleibt sie.
      *
-     * Anfragen und Sitzungen sind über alle Benutzer eindeutig (ohne Benutzer und Gerät im Schlüssel); dieselbe Anfrage
+     * Anfragen, Fehlerzeilen und Sitzungen sind über alle Benutzer eindeutig (ohne Benutzer und Gerät im Schlüssel); dieselbe Anfrage
      * zweier Geräte ist also schon beim Liefern eine Zeile, und das Umhängen erzeugt keinen Konflikt.
      *
      * false: $from gleich $into, unbekanntes oder fremdes Gerät; dann ändert sich nichts.
@@ -471,6 +471,7 @@ final class Devices
             $pdo->prepare($sql)->execute($args);
         };
         $run('update requests set device_id = ? where user_id = ? and device_id = ?', [$into, $uid, $from]);
+        $run('update request_errors set device_id = ? where user_id = ? and device_id = ?', [$into, $uid, $from]);
         $run('update sessions set device_id = ? where user_id = ? and device_id = ?', [$into, $uid, $from]);
         // Vorgeschichte: Werte und Signatur gehören immer zu genau einer Zeile. Haben beide Geräte denselben Tag,
         // bleibt der Tag des Geräts mit der größeren Summe der Tokens als Ganzes (Zeile, Modelle, Aktivität), bei

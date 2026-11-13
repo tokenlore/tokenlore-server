@@ -70,11 +70,23 @@ final class Limits
     public const MAX_TOOLS = 64;
     public const MAX_TOKENS_PER_FIELD = 100_000_000;
     public const MAX_COUNT_PER_FIELD = 10_000;
+    /** tool_input_stream_ms und thinking_duration_ms einer Anfrage: höchstens ein Tag. */
+    public const MAX_DURATION_MS = 86_400_000;
+    /** api_error_status einer Fehlerzeile (HTTP-Status). */
+    public const MIN_API_ERROR_STATUS = 100;
+    public const MAX_API_ERROR_STATUS = 599;
+    /** resets_at einer Fehlerzeile in Unix-Sekunden. */
+    public const MAX_RESETS_AT = 100_000_000_000;
 
     public const ID_PATTERN = '/^[A-Za-z0-9._:-]{1,128}\z/';
     public const TOOL_PATTERN = '/^[A-Za-z0-9._:-]{1,128}\z/';
-    /** stop_reason, effort und entrypoint. */
+    /**
+     * stop_reason, effort, entrypoint, prompt_cache_requested und cache_miss_reason; in Fehlerzeilen error,
+     * rate_limit_type, limit_status und overage_status.
+     */
     public const STOP_PATTERN = '/^[A-Za-z0-9_.-]{1,32}\z/';
+    /** attribution_plugin und attribution_agent, etwa "codecycle:builder". */
+    public const ATTRIBUTION_PATTERN = '/^[A-Za-z0-9._:-]{1,64}\z/';
     public const VERSION_PATTERN = '/^[0-9A-Za-z.+-]{1,32}\z/';
     public const EXTRA_KEY = '/^[A-Za-z0-9_]{1,64}\z/';
     public const LEGACY_DATE_PATTERN = '/^[0-9]{4}-[0-9]{2}-[0-9]{2}\z/';

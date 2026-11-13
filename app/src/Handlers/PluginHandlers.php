@@ -26,9 +26,10 @@ final class PluginHandlers
 {
     /**
      * Merkmale in GET /api/plugin/info (protocol/doc.md, „Server-Kennung“). predecessor: Koppeln nimmt
-     * predecessor_source und predecessor_answer an und fragt nach dem Vorgänger.
+     * predecessor_source und predecessor_answer an und fragt nach dem Vorgänger. request_details: die Datenannahme
+     * nimmt die neuen Felder der Anfragezeile und Fehlerzeilen (kind error) an.
      */
-    public const FEATURES = ['predecessor'];
+    public const FEATURES = ['predecessor', 'request_details'];
 
     /** Gültige Werte von predecessor_answer, genau so geschrieben. */
     private const PREDECESSOR_ANSWERS = ['same', 'new', 'later'];

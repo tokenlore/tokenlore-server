@@ -6,7 +6,7 @@ namespace Tokenlore\Protocol;
 
 // Prüft Plugin-Daten wie https://github.com/tokenlore/tokenlore/blob/main/protocol/validate.go: gleiche Regeln, Grenzen und Fehlertexte.
 // Eingaben sind dekodierte JSON-Arrays (json_decode(..., true)). Rückgabe: null = gültig, sonst der Fehlertext.
-// Ausnahme: die signierten Inhaltszeilen (requestLine, dayLine) kommen als stdClass und liefern [Pfad, Meldung].
+// Ausnahme: die signierten Inhaltszeilen (requestLine, errorLine, dayLine) kommen als stdClass und liefern [Pfad, Meldung].
 //
 // Go erzwingt Typen schon beim Dekodieren in seine Strukturen; PHP tut das nicht. Diese Prüfung steht deshalb
 // vor den Wertregeln und meldet "<feld>: falscher Typ oder Zahl außerhalb des Bereichs", den Text des Go-Dekodierers
@@ -33,7 +33,46 @@ final class Validator
         'ts' => ['string', true], 'utc_offset_min' => ['int', true], 'model' => ['string', true],
         'requested_model' => ['string', false], 'effort' => ['string', false], 'entrypoint' => ['string', false],
         'cc_version' => ['string', false], 'stop_reason' => ['string', false], 'subagent' => ['bool', true],
-        'tools' => ['object', false], 'account_id' => ['string', false], 'usage' => ['object', true],
+        'tools' => ['object', false], 'account_id' => ['string', false], 'prompt_cache_requested' => ['string', false],
+        'tool_input_stream_ms' => ['int', false], 'thinking_duration_ms' => ['int', false],
+        'attribution_plugin' => ['string', false], 'attribution_agent' => ['string', false],
+        'cache_miss_reason' => ['string', false], 'usage' => ['object', true],
+    ];
+
+    /** Felder einer Fehlerzeile (Abschnitt „Inhaltszeile: Fehler“). */
+    private const ERROR_LINE = [
+        'kind' => ['string', true], 'request_id' => ['string', true], 'message_id' => ['string', true],
+        'session_id' => ['string', true], 'uuid' => ['string', false], 'parent_uuid' => ['string', false],
+        'ts' => ['string', true], 'utc_offset_min' => ['int', true], 'entrypoint' => ['string', false],
+        'cc_version' => ['string', false], 'subagent' => ['bool', true], 'account_id' => ['string', false],
+        'api_error_status' => ['int', false], 'error' => ['string', false], 'rate_limit_type' => ['string', false],
+        'limit_status' => ['string', false], 'overage_status' => ['string', false], 'is_using_overage' => ['bool', false],
+        'resets_at' => ['int', false],
+    ];
+
+    /** Optionale Texte einer Anfrage je Muster. */
+    private const REQUEST_TEXTS = [
+        Limits::MODEL_PATTERN => ['requested_model'],
+        Limits::STOP_PATTERN => ['effort', 'entrypoint', 'stop_reason', 'prompt_cache_requested', 'cache_miss_reason'],
+        Limits::VERSION_PATTERN => ['cc_version'],
+        Limits::ATTRIBUTION_PATTERN => ['attribution_plugin', 'attribution_agent'],
+    ];
+
+    /** Optionale Texte einer Fehlerzeile je Muster. */
+    private const ERROR_TEXTS = [
+        Limits::STOP_PATTERN => ['entrypoint', 'error', 'rate_limit_type', 'limit_status', 'overage_status'],
+        Limits::VERSION_PATTERN => ['cc_version'],
+    ];
+
+    /** Neue Werte einer Anfrage (Merkmal request_details); fehlt einer, ist er null. */
+    public const REQUEST_DETAILS = [
+        'prompt_cache_requested', 'tool_input_stream_ms', 'thinking_duration_ms', 'attribution_plugin',
+        'attribution_agent', 'cache_miss_reason',
+    ];
+
+    /** Gelesene Werte einer Fehlerzeile außer Kopf, subagent und account_id; fehlt einer, ist er null. */
+    public const ERROR_VALUES = [
+        'api_error_status', 'error', 'rate_limit_type', 'limit_status', 'overage_status', 'is_using_overage', 'resets_at',
     ];
 
     /** Felder eines Vorgeschichte-Tags. */
@@ -61,10 +100,10 @@ final class Validator
     /**
      * Prüft die Inhaltszeile einer Anfrage und liest ihre Werte.
      *
-     * $out bei Erfolg: message_id, request_id, session_id, ts (Text), ts_ms (Millisekunden seit 1970, UTC),
-     * utc_offset_min, model, die Zählwerte aus USAGE_COUNTS, stop_reason und account_id ('' wenn nicht da), subagent,
-     * tools (Name => Anzahl) und extra (übrige Schlüssel der obersten Ebene von usage mit Zahl oder Text, alphabetisch,
-     * höchstens MAX_EXTRA_FIELDS).
+     * $out bei Erfolg: kind ('request'), message_id, request_id, session_id, ts (Text), ts_ms (Millisekunden seit
+     * 1970, UTC), utc_offset_min, model, die Zählwerte aus USAGE_COUNTS, stop_reason und account_id ('' wenn nicht da),
+     * subagent, tools (Name => Anzahl), extra (übrige Schlüssel der obersten Ebene von usage mit Zahl oder Text,
+     * alphabetisch, höchstens MAX_EXTRA_FIELDS) und die Werte aus REQUEST_DETAILS (null wenn nicht da).
      *
      * @param mixed $o dekodierte Zeile; $nowMs ist die Uhr des Servers in Millisekunden
      * @param array<string, mixed>|null $out
@@ -78,44 +117,15 @@ final class Validator
             return $err;
         }
         $v = get_object_vars($o);
-        foreach (['message_id', 'session_id'] as $f) {
-            if (!self::matches(Limits::ID_PATTERN, $v[$f])) {
-                return [$f, 'ungültig'];
-            }
+        $err = self::head($v, $nowMs, $head);
+        if ($err === null && !self::matches(Limits::MODEL_PATTERN, $v['model'])) {
+            $err = ['model', 'ungültig'];
         }
-        if ($v['request_id'] !== '' && !self::matches(Limits::ID_PATTERN, $v['request_id'])) {
-            return ['request_id', 'ungültig'];
-        }
-        foreach (['uuid', 'parent_uuid', 'account_id'] as $f) {
-            if (isset($v[$f]) && !self::matches(Limits::ID_PATTERN, $v[$f])) {
-                return [$f, 'ungültig'];
-            }
-        }
-        $ts = self::matches(Limits::TS_PATTERN, $v['ts']) ? self::parseTimestamp($v['ts']) : null;
-        if ($ts === null) {
-            return ['ts', 'ungültig'];
-        }
-        if ($ts[0] < Limits::EARLIEST_UNIX) {
-            return ['ts', 'vor 2024'];
-        }
-        if (self::isAfter($ts, $nowMs + Limits::MAX_FUTURE_SKEW_MS)) {
-            return ['ts', 'liegt in der Zukunft'];
-        }
-        if ($v['utc_offset_min'] < -Limits::MAX_UTC_OFFSET_MIN || $v['utc_offset_min'] > Limits::MAX_UTC_OFFSET_MIN) {
-            return ['utc_offset_min', 'außerhalb ±14 h'];
-        }
-        foreach (['model', 'requested_model'] as $f) {
-            if (($f === 'model' || isset($v[$f])) && !self::matches(Limits::MODEL_PATTERN, $v[$f])) {
-                return [$f, 'ungültig'];
-            }
-        }
-        foreach (['effort', 'entrypoint', 'stop_reason'] as $f) {
-            if (isset($v[$f]) && !self::matches(Limits::STOP_PATTERN, $v[$f])) {
-                return [$f, 'ungültig'];
-            }
-        }
-        if (isset($v['cc_version']) && !self::matches(Limits::VERSION_PATTERN, $v['cc_version'])) {
-            return ['cc_version', 'ungültig'];
+        $err ??= self::optionalTexts($v, self::REQUEST_TEXTS)
+            ?? self::optionalRange($v, 'tool_input_stream_ms', 0, Limits::MAX_DURATION_MS)
+            ?? self::optionalRange($v, 'thinking_duration_ms', 0, Limits::MAX_DURATION_MS);
+        if ($err !== null) {
+            return $err;
         }
         $tools = [];
         if (isset($v['tools'])) {
@@ -156,15 +166,131 @@ final class Validator
         ksort($extra, SORT_STRING);
         $extra = array_slice($extra, 0, Limits::MAX_EXTRA_FIELDS, true);
 
-        $out = [
-            'message_id' => $v['message_id'], 'request_id' => $v['request_id'], 'session_id' => $v['session_id'],
-            'ts' => $v['ts'], 'ts_ms' => $ts[0] * 1000 + intdiv($ts[1], 1_000_000), 'utc_offset_min' => $v['utc_offset_min'],
-            'model' => $v['model'],
-        ] + $numbers + [
+        $out = ['kind' => 'request'] + $head + ['model' => $v['model']] + $numbers + [
             'stop_reason' => $v['stop_reason'] ?? '', 'subagent' => $v['subagent'], 'tools' => $tools,
             'account_id' => $v['account_id'] ?? '', 'extra' => $extra,
+        ] + self::values($v, self::REQUEST_DETAILS);
+        return null;
+    }
+
+    /**
+     * Prüft die Inhaltszeile eines API-Fehlers und liest ihre Werte.
+     *
+     * $out bei Erfolg: kind ('error'), message_id, request_id, session_id, ts, ts_ms, utc_offset_min wie bei
+     * requestLine, subagent, account_id ('' wenn nicht da) und die Werte aus ERROR_VALUES (null wenn nicht da).
+     *
+     * @param mixed $o dekodierte Zeile; $nowMs ist die Uhr des Servers in Millisekunden
+     * @param array<string, mixed>|null $out
+     * @return array{0: string, 1: string}|null
+     */
+    public static function errorLine(mixed $o, int $nowMs, ?array &$out = null): ?array
+    {
+        $out = null;
+        $err = self::lineShape($o, 'error', self::ERROR_LINE);
+        if ($err !== null) {
+            return $err;
+        }
+        $v = get_object_vars($o);
+        $err = self::head($v, $nowMs, $head)
+            ?? self::optionalTexts($v, self::ERROR_TEXTS)
+            ?? self::optionalRange($v, 'api_error_status', Limits::MIN_API_ERROR_STATUS, Limits::MAX_API_ERROR_STATUS)
+            ?? self::optionalRange($v, 'resets_at', 0, Limits::MAX_RESETS_AT);
+        if ($err !== null) {
+            return $err;
+        }
+        $out = ['kind' => 'error'] + $head + ['subagent' => $v['subagent'], 'account_id' => $v['account_id'] ?? '']
+            + self::values($v, self::ERROR_VALUES);
+        return null;
+    }
+
+    /**
+     * Kopf einer Anfrage- oder Fehlerzeile: Kennungen (request_id darf leer sein, uuid, parent_uuid und account_id
+     * nur, wenn da), ts und utc_offset_min. $head bei Erfolg: message_id, request_id, session_id, ts (Text), ts_ms
+     * (Millisekunden seit 1970, UTC) und utc_offset_min.
+     *
+     * @param array<string, mixed> $v
+     * @param array<string, mixed>|null $head
+     * @return array{0: string, 1: string}|null
+     */
+    private static function head(array $v, int $nowMs, ?array &$head): ?array
+    {
+        $head = null;
+        foreach (['message_id', 'session_id'] as $f) {
+            if (!self::matches(Limits::ID_PATTERN, $v[$f])) {
+                return [$f, 'ungültig'];
+            }
+        }
+        if ($v['request_id'] !== '' && !self::matches(Limits::ID_PATTERN, $v['request_id'])) {
+            return ['request_id', 'ungültig'];
+        }
+        $err = self::optionalTexts($v, [Limits::ID_PATTERN => ['uuid', 'parent_uuid', 'account_id']]);
+        if ($err !== null) {
+            return $err;
+        }
+        $ts = self::matches(Limits::TS_PATTERN, $v['ts']) ? self::parseTimestamp($v['ts']) : null;
+        if ($ts === null) {
+            return ['ts', 'ungültig'];
+        }
+        if ($ts[0] < Limits::EARLIEST_UNIX) {
+            return ['ts', 'vor 2024'];
+        }
+        if (self::isAfter($ts, $nowMs + Limits::MAX_FUTURE_SKEW_MS)) {
+            return ['ts', 'liegt in der Zukunft'];
+        }
+        if ($v['utc_offset_min'] < -Limits::MAX_UTC_OFFSET_MIN || $v['utc_offset_min'] > Limits::MAX_UTC_OFFSET_MIN) {
+            return ['utc_offset_min', 'außerhalb ±14 h'];
+        }
+        $head = [
+            'message_id' => $v['message_id'], 'request_id' => $v['request_id'], 'session_id' => $v['session_id'],
+            'ts' => $v['ts'], 'ts_ms' => $ts[0] * 1000 + intdiv($ts[1], 1_000_000), 'utc_offset_min' => $v['utc_offset_min'],
         ];
         return null;
+    }
+
+    /**
+     * Optionale Texte: fehlen oder passen zu ihrem Muster.
+     *
+     * @param array<string, mixed> $v
+     * @param array<string, list<string>> $byPattern Muster => Felder
+     * @return array{0: string, 1: string}|null
+     */
+    private static function optionalTexts(array $v, array $byPattern): ?array
+    {
+        foreach ($byPattern as $pattern => $fields) {
+            foreach ($fields as $f) {
+                if (isset($v[$f]) && !self::matches($pattern, $v[$f])) {
+                    return [$f, 'ungültig'];
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Optionale ganze Zahl: fehlt oder liegt in $lo – $hi.
+     *
+     * @param array<string, mixed> $v
+     * @return array{0: string, 1: string}|null
+     */
+    private static function optionalRange(array $v, string $f, int $lo, int $hi): ?array
+    {
+        return isset($v[$f]) && ($v[$f] < $lo || $v[$f] > $hi) ? [$f, 'außerhalb des Bereichs'] : null;
+    }
+
+    /**
+     * Die Werte $fields aus $v, null für fehlende.
+     *
+     * @param array<string, mixed> $v
+     * @param list<string> $fields
+     * @return array<string, mixed>
+     */
+    private static function values(array $v, array $fields): array
+    {
+        $out = [];
+        foreach ($fields as $f) {
+            $out[$f] = $v[$f] ?? null;
+        }
+        return $out;
     }
 
     /**

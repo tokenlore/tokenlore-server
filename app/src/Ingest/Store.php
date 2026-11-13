@@ -7,16 +7,18 @@ namespace Tokenlore\Ingest;
 use PDO;
 use PDOStatement;
 use Tokenlore\Db\Database;
+use Tokenlore\Protocol\Validator;
 use Tokenlore\Util\GoJson;
 
 // Speichert ein geprüftes Paket in einer Transaktion. Jede schreibende Anweisung ist an den liefernden Benutzer
 // gebunden (user_id aus dem Geräteschlüssel, elsewhere_hits über sein Gerät); nur die Prüfungen auf Fremdes und gleiche
 // Vorgeschichte lesen über alle Benutzer.
-// Anfragen und Vorgeschichte-Tage kommen als signierte Zeilen (z, s); gespeichert wird je Zeile z und s unverändert
-// samt der daraus gelesenen Werte. Eine gespeicherte Zeile wird nie ersetzt: Kommt sie erneut, bleibt die erste samt
+// Anfragen, Fehlerzeilen und Vorgeschichte-Tage kommen als signierte Zeilen (z, s); gespeichert wird je Zeile z und s
+// unverändert samt der daraus gelesenen Werte. Eine gespeicherte Zeile wird nie ersetzt: Kommt sie erneut, bleibt die erste samt
 // Signatur, ein Maximum über zwei Zeilen gäbe es zu keiner Signatur (Abschnitt „Wiederholte Lieferung“).
 // Jede Anfrage und jede Sitzung liegt genau einmal auf dem Server, über alle Benutzer: wer zuerst liefert, besitzt
-// sie. Was einem anderen Benutzer gehört, wird übergangen und nur gezählt (elsewhere_hits); ebenso Vorgeschichte-Tage,
+// sie. Eine Fehlerzeile (requests mit kind error, Tabelle request_errors) behandelt der Store wie eine Anfrage derselben
+// Sitzung: eigener Schlüssel unter den Fehlerzeilen, sonst dieselben Regeln, und sie zählt in der Antwort als Anfrage. Was einem anderen Benutzer gehört, wird übergangen und nur gezählt (elsewhere_hits); ebenso Vorgeschichte-Tage,
 // die ein anderes Gerät schon mit genau denselben Modellen und Tokens hat.
 final class Store
 {
@@ -87,35 +89,44 @@ final class Store
             throw new DeviceRevoked();
         }
 
-        $requests = self::firstPerKey($b['requests']);
+        // Tabelle => Zeilen je Schlüssel; Anfragen und Fehlerzeilen sind je für sich eindeutig.
+        $rows = [];
+        foreach (['requests' => 'request', 'request_errors' => 'error'] as $table => $kind) {
+            $rows[$table] = self::firstPerKey(array_filter($b['requests'], static fn(array $r): bool => $r['kind'] === $kind));
+        }
         $ids = [];
-        foreach ($requests as $r) {
+        foreach (array_merge(array_values($rows['requests']), array_values($rows['request_errors']), $b['sessions']) as $r) {
             $ids[$r['session_id']] = true;
         }
-        foreach ($b['sessions'] as $s) {
-            $ids[$s['session_id']] = true;
-        }
         $foreignSessions = $this->foreignSessions($pdo, $uid, array_keys($ids));
-        $foreign = $this->foreignRequests($pdo, $uid, $requests, $foreignSessions);
-        $own = array_diff_key($requests, $foreign);
+        $foreign = [];
+        $own = [];
+        foreach ($rows as $table => $in) {
+            $foreign[$table] = $this->foreignRequests($pdo, $uid, $table, $in, $foreignSessions);
+            $own[$table] = array_diff_key($in, $foreign[$table]);
+        }
 
         $this->storeSessions($pdo, $uid, $dev, array_values(array_filter(
             $b['sessions'],
             static fn(array $s): bool => !isset($foreignSessions[$s['session_id']]),
         )));
-        $known = $this->storeRequests($pdo, $uid, $dev, $own);
+        $this->claimSessions($pdo, $uid, $dev, array_merge(array_values($own['requests']), array_values($own['request_errors'])));
+        $known = $this->storeRequests($pdo, $uid, $dev, $own['requests']) + $this->storeErrors($pdo, $uid, $dev, $own['request_errors']);
         $this->storeAccounts($pdo, $uid, $b['accounts'], $now);
         [$rejected, $hits] = $this->storeLegacy($pdo, $uid, $dev, $b['legacy_days'], $now);
-        foreach (array_keys($foreign) as $k) {
-            $hits[] = ['kind' => 'request', 'message_id' => $requests[$k]['message_id'], 'request_id' => $requests[$k]['request_id']];
+        // Übergangene Fehlerzeilen zählen wie Anfragen (kind request).
+        foreach ($foreign as $table => $keys) {
+            foreach (array_keys($keys) as $k) {
+                $hits[] = ['kind' => 'request', 'message_id' => $rows[$table][$k]['message_id'], 'request_id' => $rows[$table][$k]['request_id']];
+            }
         }
         $this->storeHits($pdo, $dev, $hits, $now);
 
-        $own = array_values(array_filter(array_map('strval', array_keys($ids)), static fn(string $id): bool => !isset($foreignSessions[$id])));
+        $ownSessions = array_values(array_filter(array_map('strval', array_keys($ids)), static fn(string $id): bool => !isset($foreignSessions[$id])));
         return [
             'known_requests' => $known,
-            'flagged_sessions' => (new Plausibility($this->db))->flag($uid, $own),
-            'elsewhere_requests' => count($foreign),
+            'flagged_sessions' => (new Plausibility($this->db))->flag($uid, $ownSessions),
+            'elsewhere_requests' => count($foreign['requests']) + count($foreign['request_errors']),
             'legacy_rejected_days' => $rejected,
         ];
     }
@@ -146,13 +157,15 @@ final class Store
     }
 
     /**
-     * Anfragen, die schon einem anderen Benutzer gehören oder in einer fremden Sitzung liegen.
+     * Anfragen (oder Fehlerzeilen, je nach $table), die schon einem anderen Benutzer gehören oder in einer fremden
+     * Sitzung liegen.
      *
-     * @param array<string, array<string, mixed>> $requests aus mergeRequests
+     * @param 'requests'|'request_errors' $table
+     * @param array<string, array<string, mixed>> $requests aus firstPerKey
      * @param array<string, true> $foreignSessions
      * @return array<string, true> Schlüssel wie in $requests
      */
-    private function foreignRequests(PDO $pdo, int $uid, array $requests, array $foreignSessions): array
+    private function foreignRequests(PDO $pdo, int $uid, string $table, array $requests, array $foreignSessions): array
     {
         $out = [];
         $keys = [];
@@ -166,7 +179,7 @@ final class Store
         if ($keys !== []) {
             $st = $pdo->prepare(
                 'select r.message_id, r.request_id from json_each(:keys) j'
-                . " join requests r on r.message_id = json_extract(j.value, '$[0]') and r.request_id = json_extract(j.value, '$[1]')"
+                . " join $table r on r.message_id = json_extract(j.value, '$[0]') and r.request_id = json_extract(j.value, '$[1]')"
                 . ' where r.user_id <> :uid',
             );
             self::run($st, [':keys' => json_encode($keys, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), ':uid' => $uid]);
@@ -302,6 +315,29 @@ final class Store
     }
 
     /**
+     * Der Besitz einer Sitzung steht immer in sessions: fehlt die Zeile, legt die erste eigene Anfrage oder
+     * Fehlerzeile sie an. Sortiert nach session_id.
+     *
+     * @param list<array<string, mixed>> $in eigene Anfragen und Fehlerzeilen
+     */
+    private function claimSessions(PDO $pdo, int $uid, int $dev, array $in): void
+    {
+        $ids = [];
+        foreach ($in as $r) {
+            $ids["\0" . $r['session_id']] = $r['session_id'];
+        }
+        ksort($ids, SORT_STRING);
+        $sess = $pdo->prepare(
+            'insert into sessions (user_id, session_id, device_id) values (?, ?, ?)'
+            . ' on conflict (session_id) do update set device_id = coalesce(sessions.device_id, excluded.device_id)'
+            . ' where sessions.user_id = excluded.user_id',
+        );
+        foreach ($ids as $id) {
+            self::run($sess, [$uid, $id, $dev]);
+        }
+    }
+
+    /**
      * Speichert neue Anfragen samt z und s; eine schon gespeicherte bleibt unverändert, mit ihren Werkzeugen.
      *
      * @param array<string, array<string, mixed>> $in aus firstPerKey, ohne fremde Anfragen
@@ -312,24 +348,11 @@ final class Store
         if ($in === []) {
             return 0;
         }
-        // Der Besitz einer Sitzung steht immer in sessions: fehlt die Zeile, legt die erste Anfrage sie an.
-        $sess = $pdo->prepare(
-            'insert into sessions (user_id, session_id, device_id) values (?, ?, ?)'
-            . ' on conflict (session_id) do update set device_id = coalesce(sessions.device_id, excluded.device_id)'
-            . ' where sessions.user_id = excluded.user_id',
-        );
-        $seen = [];
-        foreach ($in as $r) {
-            if (!isset($seen[$r['session_id']])) {
-                $seen[$r['session_id']] = true;
-                self::run($sess, [$uid, $r['session_id'], $dev]);
-            }
-        }
         $req = $pdo->prepare(
             'insert into requests (user_id, message_id, request_id, session_id, device_id, ts, utc_offset_min, model,'
             . ' input, output, cache_create, cache_read, cache_1h, cache_5m, thinking, web_search, web_fetch,'
-            . ' stop_reason, subagent, account_id, extra, z, s)'
-            . " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, nullif(?, ''), ?, nullif(?, ''), ?, ?, ?)"
+            . ' stop_reason, subagent, account_id, extra, ' . implode(', ', Validator::REQUEST_DETAILS) . ', z, s)'
+            . " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, nullif(?, ''), ?, nullif(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             . ' on conflict (message_id, request_id) do nothing',
         );
         $tool = $pdo->prepare('insert into request_tools (user_id, message_id, request_id, tool, count) values (?, ?, ?, ?, ?)');
@@ -344,7 +367,11 @@ final class Store
             foreach (self::NUMBERS as $f) {
                 $vals[] = $r[$f];
             }
-            array_push($vals, $r['stop_reason'], $r['subagent'] ? 1 : 0, $r['account_id'], $extra, $r['z'], $r['s']);
+            array_push($vals, $r['stop_reason'], $r['subagent'] ? 1 : 0, $r['account_id'], $extra);
+            foreach (Validator::REQUEST_DETAILS as $f) {
+                $vals[] = $r[$f];
+            }
+            array_push($vals, $r['z'], $r['s']);
             self::run($req, $vals);
             if ($req->rowCount() !== 1) {
                 // Schon gespeichert, von diesem Benutzer (fremde sind vorher aussortiert): bleibt wie es ist.
@@ -355,6 +382,38 @@ final class Store
             ksort($tools, SORT_STRING);
             foreach ($tools as $t => $n) {
                 self::run($tool, [$uid, $r['message_id'], $r['request_id'], (string) $t, $n]);
+            }
+        }
+        return $known;
+    }
+
+    /**
+     * Speichert neue Fehlerzeilen samt z und s; eine schon gespeicherte bleibt unverändert.
+     *
+     * @param array<string, array<string, mixed>> $in aus firstPerKey, ohne fremde Fehlerzeilen
+     * @return int Zahl der Fehlerzeilen, die schon gespeichert waren (zählen in known_requests)
+     */
+    private function storeErrors(PDO $pdo, int $uid, int $dev, array $in): int
+    {
+        if ($in === []) {
+            return 0;
+        }
+        $st = $pdo->prepare(
+            'insert into request_errors (user_id, message_id, request_id, session_id, device_id, ts, utc_offset_min, subagent,'
+            . ' account_id, ' . implode(', ', Validator::ERROR_VALUES) . ', z, s)'
+            . " values (?, ?, ?, ?, ?, ?, ?, ?, nullif(?, ''), " . str_repeat('?, ', count(Validator::ERROR_VALUES)) . '?, ?)'
+            . ' on conflict (message_id, request_id) do nothing',
+        );
+        $known = 0;
+        foreach ($in as $e) {
+            $vals = [$uid, $e['message_id'], $e['request_id'], $e['session_id'], $dev, $e['ts_ms'], $e['utc_offset_min'], $e['subagent'] ? 1 : 0, $e['account_id']];
+            foreach (Validator::ERROR_VALUES as $f) {
+                $vals[] = is_bool($e[$f]) ? (int) $e[$f] : $e[$f];
+            }
+            array_push($vals, $e['z'], $e['s']);
+            self::run($st, $vals);
+            if ($st->rowCount() !== 1) {
+                $known++;
             }
         }
         return $known;

@@ -31,7 +31,7 @@ use Tokenlore\Config\Paths;
 final class Migrator
 {
     // Höchste Nummer in app/migrations/; MigratorTest::testLatestMatchesMigrationFiles prüft das.
-    public const LATEST = 3;
+    public const LATEST = 4;
 
     private const KEEP_BACKUPS = 5;
     private const LOCK_FILE = 'migrate.lock';

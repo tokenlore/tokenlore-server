@@ -4,6 +4,16 @@ Was sich für dich als Betreiber ändert, je Version. Format nach [Keep a Change
 
 ## Unveröffentlicht
 
+## 0.5.0 – 2026-11-13
+
+### Neu
+
+- Der Server nimmt vom Plugin mehr Angaben je Anfrage an (etwa wie lange das Nachdenken dauerte, welches Plugin oder welcher Agent die Anfrage stellte und warum der Cache nicht griff) und hält API-Fehler wie erreichte Nutzungsgrenzen fest. Die Webseite zeigt sie nicht an.
+
+### Geändert
+
+- Aktualisiere den Server vor dem Plugin. Ein neueres Plugin hält bei einem älteren Server mit dem Liefern an, sobald es neue Angaben oder API-Fehler liefern will, und sagt dir, dass du den Server aktualisieren sollst; danach liefert es den Rest beim nächsten Abgleich nach.
+
 ## 0.4.0 – 2026-11-13
 
 ### Neu
